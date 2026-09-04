@@ -49,8 +49,14 @@ For local MoviePilot development:
 3. Restart MoviePilot or reload its plugin list, then install/enable
    `MTeamAdultSearch` from the plugin manager.
 
-For normal remote installation, push this repository to GitHub and add its
-repository URL to MoviePilot's `PLUGIN_MARKET`, then refresh the plugin market.
+For normal remote installation, add this repository URL to MoviePilot's
+`PLUGIN_MARKET` and refresh the plugin market:
+
+```text
+https://github.com/shengleiRain/MoviePilot-Plugins
+```
+
+Then install `MTeamAdultSearch` from the refreshed plugin list.
 The V2 index is `package.v2.json`, and the implementation is under
 `plugins.v2/mteamadultsearch/`.
 

@@ -30,7 +30,12 @@ MoviePilot 原生运行在 Windows 时，`PLUGIN_LOCAL_REPO_PATHS` 直接填写�
 
 ### 远程插件市场安装
 
-将本仓库推送到 GitHub 后，把仓库地址加入 MoviePilot 的 `PLUGIN_MARKET`，
+将本仓库地址加入 MoviePilot 的 `PLUGIN_MARKET`：
+
+```text
+https://github.com/shengleiRain/MoviePilot-Plugins
+```
+
 刷新插件市场，再安装 `M-Team 成人区番号搜索`。V2 使用
 `package.v2.json` 和 `plugins.v2/mteamadultsearch/`。
 
