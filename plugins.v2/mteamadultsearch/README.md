@@ -47,10 +47,10 @@ https://github.com/shengleiRain/MoviePilot-Plugins
 2. 打开 `启用插件`。
 3. 先在 MoviePilot 的下载目录设置中配置可用下载根目录。
 4. 在 `AV 下载目录` 中选择一个已配置目录，或选择使用 MoviePilot 默认目录。
-5. 保存设置。
+5. 按需开关 `提交成功后推送通知`，保存设置。
 
-插件不会重复保存 M-Team API Key。`M-Team 站点 ID` 留空或填 `0` 时，会自动
-选择第一个 M-Team `mTorrent` 站点；有多个 M-Team 站点时填写对应 ID。
+插件自动绑定 M-Team `mTorrent` 站点，无需配置站点 ID。插件不会重复保存
+M-Team API Key。
 
 目录值使用 MoviePilot 的路径语义，例如：
 
@@ -60,17 +60,28 @@ rclone:/moviepilot/av
 ```
 
 插件会使用 MoviePilot 的目录 allowlist 校验保存路径，不接受未配置的任意
-路径。
+路径。插件详情页展示状态、绑定站点、下载目录与最近提交记录。
 
 ## API
 
 ```text
 POST /api/v1/plugin/MTeamAdultSearch/search
 POST /api/v1/plugin/MTeamAdultSearch/submit
+GET  /api/v1/plugin/MTeamAdultSearch/paths
 ```
 
+`/search` 支持 `max_pages`（多页聚合去重）、`sort`（`site`/`seeders`/
+`size`/`time`/`free_first`）与 `free_only`（只看免费）；`keyword` 兼容标准
+番号与自由关键词（响应 `is_av_number` 区分），相同关键词短时缓存。候选带
+`is_free` 免费标识。
+
 搜索响应只包含安全候选字段。原始 M-Team 行数据保存在插件进程内的短期
-搜索会话中；提交时插件才生成 `genDlToken` 凭据并调用 MoviePilot 下载链。
+搜索会话中；提交时插件才生成 `genDlToken` 凭据并调用 MoviePilot 下载链，
+成功后记录提交历史并按开关推送通知。
+
+错误响应为标准 HTTP 状态码，detail 格式 `[错误码] 说明`
+（如 `[session_expired] 搜索会话不存在或已过期`），调用方可按状态码决定
+重新搜索或报错。
 
 ## 正常搜索隔离
 

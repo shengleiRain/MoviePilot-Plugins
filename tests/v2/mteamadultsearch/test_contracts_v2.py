@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _PLUGIN_DIR = (
     Path(__file__).resolve().parents[3] / "plugins.v2" / "mteamadultsearch"
 )
@@ -25,6 +27,23 @@ contracts = _load_contracts()
 def test_normalizes_common_av_number_separators():
     assert contracts.normalize_av_keyword(" pred 879 ") == "PRED-879"
     assert contracts.normalize_av_keyword("PRED_879") == "PRED-879"
+
+
+def test_free_keyword_passes_through_with_flag():
+    keyword, is_av = contracts.normalize_search_keyword(" Some   Actor ")
+    assert keyword == "Some Actor"
+    assert is_av is False
+
+
+def test_strict_number_detected_by_search_normalizer():
+    keyword, is_av = contracts.normalize_search_keyword("pred 879")
+    assert keyword == "PRED-879"
+    assert is_av is True
+
+
+def test_empty_keyword_rejected():
+    with pytest.raises(ValueError):
+        contracts.normalize_search_keyword("   ")
 
 
 def test_builds_mteam_adult_search_payload():

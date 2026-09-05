@@ -3,7 +3,7 @@
     "name": "M-Team 成人区番号搜索",
     "description": "为 MoviePilot V2 提供独立的 M-Team 成人区番号搜索，不修改内置的正常影片搜索。",
     "labels": "资源搜索,M-Team,AV",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "Moviepilot_A.png",
     "author": "PrivateFilm",
     "level": 2,
@@ -11,6 +11,7 @@
     "v3": false,
     "release": true,
     "history": {
+      "v1.2.0": "去掉站点 ID 配置（自动绑定 M-Team 站点）；表单改为栅格布局并增加提交通知开关；搜索支持多页聚合、排序与免费过滤、自由关键词和短缓存限速；错误响应改用标准 HTTP 状态码与错误码；新增提交历史展示。",
       "v1.1.0": "增加 V2 设置页、下载目录选择、目录校验和安装说明。",
       "v1.0.0": "初始版本：M-Team 成人区番号搜索与 MoviePilot 下载链路。"
     }

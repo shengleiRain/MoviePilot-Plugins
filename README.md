@@ -18,7 +18,7 @@ package.v3.json              # V3 市场索引（MTeamAdultSearch v2.0.0，>=3.0
 plugins.v2/mteamadultsearch/ # V2 实现（旧实现原样保留）
 plugins.v3/mteamadultsearch/ # V3 实现（SDK 导入移植，行为与 V2 一致）
 icons/Moviepilot_A.png       # 插件图标（取自官方仓库）
-tests/                       # V2/V3 契约测试 + contracts.py 一致性守护
+tests/                       # V2/V3 契约测试、宿主桩端点测试、contracts.py 一致性守护
 .github/scripts/             # 官方版本门禁脚本 check_plugin_versions.py
 ```
 
@@ -57,13 +57,14 @@ MoviePilot 原生运行在 Windows 时，`PLUGIN_LOCAL_REPO_PATHS` 直接填写�
 ## 配置与使用
 
 1. 先在 MoviePilot 中配置 M-Team 站点，包含 API Access Token 和
-   `mTorrent` 解析器。
+   `mTorrent` 解析器。插件自动绑定该站点，无需也不显示站点 ID。
 2. 在插件管理中启用 `M-Team 成人区番号搜索`。
 3. 先配置 MoviePilot 的下载目录；插件的 `AV 下载目录` 选择器只会列出已
    配置的下载根目录，可留空表示使用 MoviePilot 默认目录。
-4. 可选配置：M-Team 站点 ID（留空/0 自动识别第一个 `mTorrent` 站点）、
-   M-Team API 地址（默认 `https://api.m-team.cc/api`）、请求超时。
-5. 保存设置。无效或未配置的目录会在提交时被拒绝，插件详情页也会提示。
+4. 可选配置：M-Team API 地址（默认官方地址）、请求超时、
+   `提交成功后推送通知` 开关（通过 MoviePilot 消息渠道推送）。
+5. 保存设置。无效或未配置的目录会在提交时被拒绝，插件详情页也会提示，
+   并展示最近提交记录。
 
 插件不会重复保存 M-Team API Key，一切凭据留在 MoviePilot 侧。
 
@@ -79,14 +80,34 @@ POST /api/v1/plugin/MTeamAdultSearch/submit
 GET  /api/v1/plugin/MTeamAdultSearch/paths
 ```
 
-在 MoviePilot 的 `/docs` 页测试搜索：
+`/search` 请求体：
 
 ```json
-{"keyword":"PRED-879","page":1,"page_size":100}
+{"keyword":"PRED-879","page":1,"page_size":100,
+ "max_pages":1,"sort":"site","free_only":false}
 ```
 
-选中候选后用返回的 `search_id` / `id` 提交到 `/submit`，插件在
-MoviePilot 进程内生成 `genDlToken` 凭据下载 URL 并通过宿主下载链创建任务。
+- `keyword` 支持标准番号（自动归一化）和自由关键词（演员名等，响应中
+  `is_av_number` 区分）
+- `max_pages`（1–5）：一次请求聚合多页并按资源 ID 去重
+- `sort`：`site`（站点原始顺序）/ `seeders` / `size` / `time` / `free_first`
+  （免费优先，其余保持站点顺序）
+- `free_only`：只返回免费（下载系数为 0）的资源，候选含 `is_free` 标识
+- 相同关键词短时结果缓存 120 秒，对站点请求保持最小间隔，避免频繁触发
+
+`/submit` 用 `/search` 返回的 `search_id` / `id` 提交，插件在 MoviePilot
+进程内生成 `genDlToken` 凭据下载 URL 并通过宿主下载链创建任务，成功后
+记录提交历史并可推送通知。
+
+错误响应使用标准 HTTP 状态码，格式为 `[错误码] 说明`：
+
+| 状态码 | 错误码 | 含义 |
+| --- | --- | --- |
+| 400 | `invalid_keyword` / `invalid_sort` / `invalid_api_url` / `invalid_save_path` / `site_not_configured` | 请求参数或宿主配置问题 |
+| 404 | `candidate_not_found` | 候选不存在或已被提交 |
+| 409 | `plugin_disabled` | 插件未启用 |
+| 410 | `session_expired` | 搜索会话过期，需重新搜索 |
+| 502 | `upstream_error` / `download_failed` | 站点或下载链路失败 |
 
 ## PrivateFilm 集成约定
 

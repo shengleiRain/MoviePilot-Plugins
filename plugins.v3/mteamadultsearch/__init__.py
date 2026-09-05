@@ -14,10 +14,12 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from app.application.directory import DirectoryHelper, validate_download_save_path
@@ -25,19 +27,38 @@ from app.chain.download import DownloadChain
 from app.plugins import _PluginBase
 from app.sdk.media import Context, MediaInfo, MetaInfo, TorrentInfo
 from app.sdk.network import RequestUtils, SitesHelper
-from app.schemas.types import MediaType
+from app.schemas.types import MediaType, MessageType
 from .contracts import (
     DEFAULT_API_BASE_URL,
     build_credential_enclosure,
     build_search_payload,
+    normalize_search_keyword,
 )
 
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 100
 MAX_PAGE = 500
+MAX_PAGES_PER_REQUEST = 5
 SESSION_TTL_SECONDS = 15 * 60
 MAX_SESSIONS = 40
+SEARCH_CACHE_TTL_SECONDS = 120
+SEARCH_CACHE_MAX_ENTRIES = 20
+MIN_REQUEST_INTERVAL_SECONDS = 1.0
+HISTORY_KEY = "submission_history"
+HISTORY_LIMIT = 50
+HISTORY_PAGE_SIZE = 5
+SORT_OPTIONS = ("site", "seeders", "size", "time", "free_first")
+
+
+class PluginApiError(Exception):
+    """Plugin API failure mapped to a stable HTTP status and error code."""
+
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 
 
 class SearchRequest(BaseModel):
@@ -46,6 +67,9 @@ class SearchRequest(BaseModel):
     keyword: str = Field(..., min_length=1, max_length=100)
     page: int = Field(default=1, ge=1, le=MAX_PAGE)
     page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    max_pages: int = Field(default=1, ge=1, le=MAX_PAGES_PER_REQUEST)
+    sort: str = Field(default="site")
+    free_only: bool = Field(default=False)
 
 
 class SearchCandidate(BaseModel):
@@ -63,6 +87,7 @@ class SearchCandidate(BaseModel):
     download_factor: Optional[float] = None
     upload_factor: Optional[float] = None
     detail_url: Optional[str] = None
+    is_free: bool = False
 
 
 class SearchResponse(BaseModel):
@@ -74,6 +99,7 @@ class SearchResponse(BaseModel):
     page_size: int
     total: Optional[int] = None
     items: List[SearchCandidate]
+    is_av_number: bool = False
 
 
 class SubmitRequest(BaseModel):
@@ -89,6 +115,7 @@ class SubmitResponse(BaseModel):
     submitted: bool
     download_id: Optional[str] = None
     save_path: Optional[str] = None
+    title: Optional[str] = None
 
 
 class PathResponse(BaseModel):
@@ -124,7 +151,7 @@ class MTeamAdultSearch(_PluginBase):
     plugin_name = "M-Team 成人区番号搜索"
     plugin_desc = "独立调用 M-Team 成人区 API，支持 AV 番号搜索和 MoviePilot 下载。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleirain"
     plugin_config_prefix = "mteamadultsearch_"
@@ -133,7 +160,10 @@ class MTeamAdultSearch(_PluginBase):
 
     _enabled = False
     _config: Dict[str, Any] = {}
+    _notify = True
     _sessions: Dict[str, _SearchSession] = {}
+    _search_cache: Dict[str, Dict[str, Any]] = {}
+    _last_upstream_at = 0.0
     _lock = threading.RLock()
     _save_path_error: Optional[str] = None
 
@@ -142,15 +172,17 @@ class MTeamAdultSearch(_PluginBase):
 
         self._config = dict(config or {})
         self._enabled = bool(self._config.get("enabled", False))
+        self._notify = bool(self._config.get("notify", True))
         self._save_path_error = None
         configured_path = self._string(self._config.get("save_path"))
         if configured_path:
             try:
                 self._save_path()
             except Exception as error:
-                self._save_path_error = str(error)
+                self._save_path_error = self._message_of(error)
         with self._lock:
             self._sessions.clear()
+            self._search_cache.clear()
 
     def get_state(self) -> bool:
         """Return whether the plugin is enabled."""
@@ -194,7 +226,7 @@ class MTeamAdultSearch(_PluginBase):
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """Render the standard V3 configuration form."""
+        """Render the standard V3 configuration form on a responsive grid."""
 
         return [
             {
@@ -218,14 +250,27 @@ class MTeamAdultSearch(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "notify",
+                                            "label": "提交成功后推送通知",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "site_id",
-                                            "label": "M-Team 站点 ID",
-                                            "placeholder": "留空或 0 自动识别",
+                                            "model": "timeout_seconds",
+                                            "label": "请求超时（秒）",
+                                            "type": "number",
                                         },
                                     }
                                 ],
@@ -233,54 +278,64 @@ class MTeamAdultSearch(_PluginBase):
                         ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "api_base_url",
-                            "label": "M-Team API 地址",
-                            "placeholder": DEFAULT_API_BASE_URL,
-                        },
-                    },
-                    {
-                        "component": "VSelect",
-                        "props": {
-                            "model": "save_path",
-                            "label": "AV 下载目录",
-                            "items": self._download_path_options(),
-                            "item-title": "title",
-                            "item-value": "value",
-                            "clearable": True,
-                            "hint": "只显示 MoviePilot 已配置的下载目录；清空表示使用默认目录",
-                            "persistentHint": True,
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "timeout_seconds",
-                            "label": "请求超时（秒）",
-                        },
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "api_base_url",
+                                            "label": "M-Team API 地址",
+                                            "placeholder": DEFAULT_API_BASE_URL,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "save_path",
+                                            "label": "AV 下载目录",
+                                            "items": self._download_path_options(),
+                                            "item-title": "title",
+                                            "item-value": "value",
+                                            "clearable": True,
+                                            "hint": "只显示 MoviePilot 已配置的下载目录；清空表示使用默认目录",
+                                            "persistentHint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                 ],
             }
         ], {
             "enabled": False,
-            "site_id": 0,
             "api_base_url": DEFAULT_API_BASE_URL,
             "save_path": "",
             "timeout_seconds": 30,
+            "notify": True,
         }
 
     def get_page(self) -> List[dict]:
-        """Show the plugin status, selected site, and download directory."""
+        """Show the plugin status, bound site, download directory and history."""
 
         status = "已启用" if self._enabled else "未启用"
-        site_text = "未找到 M-Team mTorrent 站点"
+        site_text = "未找到 M-Team 站点"
         try:
             site = self._resolve_site()
-            site_id = self._int_value(site.get("id"))
-            site_text = f"{self._string(site.get('name')) or 'M-Team'}（ID: {site_id or '自动'}）"
+            site_name = self._string(site.get("name")) or "M-Team"
+            site_text = f"已绑定站点：{site_name}"
         except Exception as error:
-            site_text = str(error)
+            site_text = self._message_of(error)
         path = self._string(self._config.get("save_path")) or "MoviePilot 默认下载目录"
 
         pages = [
@@ -300,7 +355,7 @@ class MTeamAdultSearch(_PluginBase):
                 "props": {
                     "type": "info",
                     "variant": "tonal",
-                    "text": f"状态：{status}；M-Team：{site_text}；AV 下载目录：{path}",
+                    "text": f"状态：{status}；{site_text}；AV 下载目录：{path}",
                 },
             },
         ]
@@ -311,7 +366,35 @@ class MTeamAdultSearch(_PluginBase):
                     "props": {
                         "type": "warning",
                         "variant": "tonal",
-                        "text": f"下载目录配置无效：{self._save_path_error}。请在 MoviePilot 下载目录中先配置并重新选择。",
+                        "text": (
+                            f"下载目录配置无效：{self._save_path_error}。"
+                            "请在 MoviePilot 下载目录中先配置并重新选择。"
+                        ),
+                    },
+                }
+            )
+        records = self._load_history()
+        summary = "最近提交：暂无" if not records else "最近提交："
+        pages.append(
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "text": summary},
+            }
+        )
+        for record in records[:HISTORY_PAGE_SIZE]:
+            if not isinstance(record, dict):
+                continue
+            saved_at = self._string(record.get("time")) or "-"
+            title = self._string(record.get("title")) or "未命名资源"
+            download_id = self._string(record.get("download_id")) or "-"
+            pages.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "success",
+                        "variant": "tonal",
+                        "density": "compact",
+                        "text": f"{saved_at}｜{title}｜任务 {download_id}",
                     },
                 }
             )
@@ -322,21 +405,87 @@ class MTeamAdultSearch(_PluginBase):
 
         with self._lock:
             self._sessions.clear()
+            self._search_cache.clear()
         self._enabled = False
 
     def search(self, request: SearchRequest) -> SearchResponse:
         """Search M-Team adult resources and store opaque candidates server-side."""
 
+        try:
+            return self._search(request)
+        except PluginApiError as error:
+            raise self._to_http_error(error) from error
+
+    def submit(self, request: SubmitRequest) -> SubmitResponse:
+        """Submit a stored M-Team candidate through MoviePilot's DownloadChain."""
+
+        try:
+            return self._submit(request)
+        except PluginApiError as error:
+            raise self._to_http_error(error) from error
+
+    def paths(self) -> List[PathResponse]:
+        """Return configured MoviePilot paths without exposing arbitrary paths."""
+
+        try:
+            self._require_enabled()
+        except PluginApiError as error:
+            raise self._to_http_error(error) from error
+        result: List[PathResponse] = []
+        for entry in DirectoryHelper().get_download_dirs() or []:
+            path = self._string(getattr(entry, "download_path", None))
+            if not path:
+                continue
+            storage = self._string(getattr(entry, "storage", None)) or "local"
+            name = self._string(getattr(entry, "name", None)) or path
+            result.append(
+                PathResponse(
+                    name=name,
+                    save_path=f"{storage}:{path}",
+                    media_type=self._string(getattr(entry, "media_type", None)),
+                    media_category=self._string(
+                        getattr(entry, "media_category", None)
+                    ),
+                )
+            )
+        return result
+
+    def _search(self, request: SearchRequest) -> SearchResponse:
+        """Search implementation shared by the API endpoint."""
+
         self._require_enabled()
-        payload = build_search_payload(request.keyword, request.page, request.page_size)
-        keyword = payload["keyword"]
+        if request.sort not in SORT_OPTIONS:
+            raise PluginApiError(
+                400,
+                "invalid_sort",
+                f"sort 必须是 {'/'.join(SORT_OPTIONS)} 之一",
+            )
+        try:
+            keyword, is_av_number = normalize_search_keyword(request.keyword)
+        except ValueError as error:
+            raise PluginApiError(400, "invalid_keyword", str(error)) from error
+
         site = self._resolve_site()
-        response = self._post_json(
-            f"{self._api_base_url()}/torrent/search",
-            payload,
-            site,
-        )
-        rows, total = self._parse_search_response(response)
+        cache_key = (keyword, request.page, request.page_size, request.max_pages)
+        entry = self._cache_get(cache_key)
+        if entry is not None:
+            rows: List[Dict[str, Any]] = entry["rows"]
+            total: Optional[int] = entry["total"]
+            site = entry["site"]
+        else:
+            try:
+                rows, total = self._fetch_rows(
+                    keyword=keyword,
+                    page=request.page,
+                    page_size=request.page_size,
+                    max_pages=request.max_pages,
+                    site=site,
+                )
+            except ValueError as error:
+                raise PluginApiError(400, "invalid_api_url", str(error)) from error
+            self._cache_put(cache_key, rows, total, site)
+
+        rows = self._sorted_rows(rows, request.sort, request.free_only)
 
         session_id = uuid4().hex
         safe_items: List[SearchCandidate] = []
@@ -369,23 +518,31 @@ class MTeamAdultSearch(_PluginBase):
             page_size=request.page_size,
             total=total,
             items=safe_items,
+            is_av_number=is_av_number,
         )
 
-    def submit(self, request: SubmitRequest) -> SubmitResponse:
-        """Submit a stored M-Team candidate through MoviePilot's DownloadChain."""
+    def _submit(self, request: SubmitRequest) -> SubmitResponse:
+        """Submit implementation shared by the API endpoint."""
 
         self._require_enabled()
+        try:
+            save_path = self._save_path()
+        except ValueError as error:
+            raise PluginApiError(400, "invalid_save_path", str(error)) from error
         stored = self._take_candidate(request.search_id, request.candidate_id)
         site = stored.site
         raw = stored.raw
         torrent_id = self._string(raw.get("id"))
         title = self._string(raw.get("name"))
         if not torrent_id or not title:
-            raise ValueError("M-Team 候选缺少必要字段")
+            raise PluginApiError(400, "invalid_candidate", "M-Team 候选缺少必要字段")
 
         api_key = self._site_api_key(site)
         user_agent = self._site_user_agent(site)
-        api_url = self._api_base_url()
+        try:
+            api_url = self._api_base_url()
+        except ValueError as error:
+            raise PluginApiError(400, "invalid_api_url", str(error)) from error
         torrent_dict = self._torrent_dict(
             raw=raw,
             site=site,
@@ -411,42 +568,184 @@ class MTeamAdultSearch(_PluginBase):
         download_id = DownloadChain().download_single(
             context=context,
             username=self.plugin_name,
-            save_path=self._save_path(),
+            save_path=save_path,
             source="MTeamAdultSearch",
         )
         if not download_id:
-            raise RuntimeError("MoviePilot 未能创建下载任务")
+            raise PluginApiError(502, "download_failed", "MoviePilot 未能创建下载任务")
+        record = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "keyword": stored.keyword,
+            "title": title,
+            "download_id": str(download_id),
+            "save_path": save_path or "",
+        }
+        self._record_history(record)
+        self._notify_submit(record)
         return SubmitResponse(
             submitted=True,
             download_id=str(download_id),
-            save_path=self._save_path(),
+            save_path=save_path,
+            title=title,
         )
 
-    def paths(self) -> List[PathResponse]:
-        """Return configured MoviePilot paths without exposing arbitrary paths."""
+    def _fetch_rows(
+        self,
+        keyword: str,
+        page: int,
+        page_size: int,
+        max_pages: int,
+        site: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Fetch up to ``max_pages`` pages and merge them without duplicates."""
 
-        self._require_enabled()
-        result: List[PathResponse] = []
-        for entry in DirectoryHelper().get_download_dirs() or []:
-            path = self._string(getattr(entry, "download_path", None))
-            if not path:
-                continue
-            storage = self._string(getattr(entry, "storage", None)) or "local"
-            name = self._string(getattr(entry, "name", None)) or path
-            result.append(
-                PathResponse(
-                    name=name,
-                    save_path=f"{storage}:{path}",
-                    media_type=self._string(getattr(entry, "media_type", None)),
-                    media_category=self._string(
-                        getattr(entry, "media_category", None)
-                    ),
+        rows: List[Dict[str, Any]] = []
+        seen: set = set()
+        total: Optional[int] = None
+        url = f"{self._api_base_url()}/torrent/search"
+        for index in range(max_pages):
+            payload = build_search_payload(keyword, page + index, page_size)
+            self._throttle()
+            body = self._post_json(url, payload, site)
+            page_rows, page_total = self._parse_search_response(body)
+            if total is None:
+                total = page_total
+            for row in page_rows:
+                torrent_id = self._string(row.get("id"))
+                if not torrent_id or torrent_id in seen:
+                    continue
+                seen.add(torrent_id)
+                rows.append(row)
+            if len(page_rows) < page_size:
+                break
+            if total is not None and len(rows) >= total:
+                break
+        return rows, total
+
+    def _sorted_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        sort: str,
+        free_only: bool,
+    ) -> List[Dict[str, Any]]:
+        """Apply the free filter and requested ordering to a page copy."""
+
+        rows = list(rows)
+        if free_only:
+            rows = [row for row in rows if self._row_is_free(row)]
+        if sort == "seeders":
+            rows.sort(
+                key=lambda row: self._int_value(
+                    (row.get("status") or {}).get("seeders")
                 )
+                or 0,
+                reverse=True,
             )
-        return result
+        elif sort == "size":
+            rows.sort(
+                key=lambda row: self._int_value(row.get("size")) or 0,
+                reverse=True,
+            )
+        elif sort == "time":
+            rows.sort(
+                key=lambda row: self._string(row.get("createdDate")) or "",
+                reverse=True,
+            )
+        elif sort == "free_first":
+            rows.sort(key=lambda row: 0 if self._row_is_free(row) else 1)
+        return rows
+
+    def _row_is_free(self, row: Dict[str, Any]) -> bool:
+        status = row.get("status") if isinstance(row.get("status"), dict) else {}
+        return self._discount_factor(status.get("discount")) == 0.0
+
+    def _cache_get(self, key: Tuple[str, int, int, int]) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            entry = self._search_cache.get(key)
+            if not entry:
+                return None
+            if time.time() > entry["expires_at"]:
+                self._search_cache.pop(key, None)
+                return None
+            return entry
+
+    def _cache_put(
+        self,
+        key: Tuple[str, int, int, int],
+        rows: List[Dict[str, Any]],
+        total: Optional[int],
+        site: Dict[str, Any],
+    ) -> None:
+        with self._lock:
+            now = time.time()
+            expired = [
+                item for item, entry in self._search_cache.items()
+                if now > entry["expires_at"]
+            ]
+            for item in expired:
+                self._search_cache.pop(item, None)
+            while len(self._search_cache) >= SEARCH_CACHE_MAX_ENTRIES:
+                oldest = min(
+                    self._search_cache.items(),
+                    key=lambda pair: pair[1]["created_at"],
+                )[0]
+                self._search_cache.pop(oldest, None)
+            self._search_cache[key] = {
+                "created_at": now,
+                "expires_at": now + SEARCH_CACHE_TTL_SECONDS,
+                "rows": rows,
+                "total": total,
+                "site": site,
+            }
+
+    def _throttle(self) -> None:
+        """Keep a minimum interval between upstream M-Team requests."""
+
+        with self._lock:
+            wait = self._last_upstream_at + MIN_REQUEST_INTERVAL_SECONDS - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self._last_upstream_at = time.time()
+
+    def _record_history(self, record: Dict[str, Any]) -> None:
+        """Persist the newest-first submission history, never failing submits."""
+
+        records = self._load_history()
+        records.insert(0, record)
+        del records[HISTORY_LIMIT:]
+        try:
+            self.save_data(HISTORY_KEY, records)
+        except Exception:
+            pass
+
+    def _load_history(self) -> List[Dict[str, Any]]:
+        try:
+            records = self.get_data(HISTORY_KEY)
+        except Exception:
+            return []
+        if not isinstance(records, list):
+            return []
+        return [record for record in records if isinstance(record, dict)]
+
+    def _notify_submit(self, record: Dict[str, Any]) -> None:
+        """Push a message-channel notification; failures never block submits."""
+
+        if not self._notify:
+            return
+        text = f"{record['title']}\n下载 ID：{record['download_id']}"
+        if record.get("save_path"):
+            text += f"\n保存目录：{record['save_path']}"
+        try:
+            self.post_message(
+                mtype=MessageType.Plugin,
+                title="M-Team 下载任务已提交",
+                text=text,
+            )
+        except Exception:
+            pass
 
     def _download_path_options(self) -> List[Dict[str, str]]:
-        """Build V2 form options from MoviePilot's configured download roots."""
+        """Build form options from MoviePilot's configured download roots."""
 
         options: List[Dict[str, str]] = [
             {"title": "使用 MoviePilot 默认下载目录", "value": ""}
@@ -471,35 +770,35 @@ class MTeamAdultSearch(_PluginBase):
         return options
 
     def _resolve_site(self) -> Dict[str, Any]:
-        """Find the configured M-Team mTorrent indexer and its API credentials."""
+        """Find the bound M-Team mTorrent indexer and its API credentials."""
 
-        configured_id = self._int_value(self._config.get("site_id"))
         indexers = SitesHelper().get_indexers() or []
         candidates = [
             item
             for item in indexers
             if str(item.get("parser") or "") == "mTorrent"
         ]
-        if configured_id:
-            candidates = [
-                item
-                for item in candidates
-                if self._int_value(item.get("id")) == configured_id
-            ]
-        else:
-            mteam_candidates = [
-                item
-                for item in candidates
-                if "m-team" in (
-                    f"{item.get('name', '')} {item.get('domain', '')}"
-                ).lower()
-            ]
-            candidates = mteam_candidates or candidates
+        mteam_candidates = [
+            item
+            for item in candidates
+            if "m-team" in (
+                f"{item.get('name', '')} {item.get('domain', '')}"
+            ).lower()
+        ]
+        candidates = mteam_candidates or candidates
         if not candidates:
-            raise RuntimeError("未找到 MoviePilot 的 M-Team mTorrent 站点")
+            raise PluginApiError(
+                400,
+                "site_not_configured",
+                "未找到 M-Team 站点：请先在 MoviePilot 站点中配置 mTorrent 解析器",
+            )
         site = dict(candidates[0])
         if not self._site_api_key(site):
-            raise RuntimeError("M-Team 站点未配置 API Access Token")
+            raise PluginApiError(
+                400,
+                "site_not_configured",
+                "M-Team 站点未配置 API Access Token",
+            )
         return site
 
     def _post_json(
@@ -522,15 +821,21 @@ class MTeamAdultSearch(_PluginBase):
             timeout=self._timeout_seconds(),
         ).post_res(url=url, json=payload)
         if response is None:
-            raise RuntimeError("M-Team 搜索请求无法连接")
+            raise PluginApiError(502, "upstream_error", "M-Team 搜索请求无法连接")
         if response.status_code < 200 or response.status_code >= 300:
-            raise RuntimeError(f"M-Team 搜索返回 HTTP {response.status_code}")
+            raise PluginApiError(
+                502,
+                "upstream_error",
+                f"M-Team 搜索返回 HTTP {response.status_code}",
+            )
         try:
             body = response.json()
         except Exception as error:
-            raise RuntimeError("M-Team 返回格式无效") from error
+            raise PluginApiError(
+                502, "upstream_error", "M-Team 返回格式无效"
+            ) from error
         if not isinstance(body, dict):
-            raise RuntimeError("M-Team 返回格式无效")
+            raise PluginApiError(502, "upstream_error", "M-Team 返回格式无效")
         return body
 
     def _parse_search_response(
@@ -542,7 +847,7 @@ class MTeamAdultSearch(_PluginBase):
         code = body.get("code")
         if code not in (None, 0, "0", 200, "200"):
             message = self._string(body.get("message")) or "M-Team 搜索失败"
-            raise RuntimeError(message)
+            raise PluginApiError(502, "upstream_error", message)
         data = body.get("data")
         if not isinstance(data, dict):
             return [], 0
@@ -564,6 +869,7 @@ class MTeamAdultSearch(_PluginBase):
         labels = raw.get("labelsNew")
         if not isinstance(labels, list):
             labels = []
+        download_factor = self._discount_factor(status.get("discount"))
         return SearchCandidate(
             id=candidate_id,
             title=self._string(raw.get("name")) or "未命名资源",
@@ -574,9 +880,10 @@ class MTeamAdultSearch(_PluginBase):
             published_at=self._string(raw.get("createdDate")),
             category=self._string(raw.get("category")),
             labels=[str(label) for label in labels if str(label).strip()],
-            download_factor=self._discount_factor(status.get("discount")),
+            download_factor=download_factor,
             upload_factor=self._upload_factor(status.get("discount")),
             detail_url=self._detail_url(site, raw.get("id")),
+            is_free=download_factor == 0.0,
         )
 
     def _torrent_dict(
@@ -621,10 +928,10 @@ class MTeamAdultSearch(_PluginBase):
             self._purge_sessions()
             session = self._sessions.get(search_id)
             if not session:
-                raise ValueError("搜索会话不存在或已过期")
+                raise PluginApiError(410, "session_expired", "搜索会话不存在或已过期")
             candidate = session.candidates.pop(candidate_id, None)
             if not candidate:
-                raise ValueError("搜索候选不存在或已提交")
+                raise PluginApiError(404, "candidate_not_found", "搜索候选不存在或已提交")
             if not session.candidates:
                 self._sessions.pop(search_id, None)
             return candidate
@@ -646,7 +953,18 @@ class MTeamAdultSearch(_PluginBase):
 
     def _require_enabled(self) -> None:
         if not self._enabled:
-            raise RuntimeError("M-Team 成人区番号搜索插件未启用")
+            raise PluginApiError(409, "plugin_disabled", "M-Team 成人区番号搜索插件未启用")
+
+    @staticmethod
+    def _to_http_error(error: PluginApiError) -> HTTPException:
+        return HTTPException(
+            status_code=error.status_code,
+            detail=f"[{error.code}] {error.message}",
+        )
+
+    @staticmethod
+    def _message_of(error: Exception) -> str:
+        return str(getattr(error, "message", None) or error)
 
     def _api_base_url(self) -> str:
         value = self._string(self._config.get("api_base_url")) or DEFAULT_API_BASE_URL
