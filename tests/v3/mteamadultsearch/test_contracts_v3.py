@@ -1,33 +1,34 @@
-"""Pure contract tests for the MoviePilot V2 M-Team adult plugin."""
+"""Pure contract tests for the MoviePilot V3 M-Team adult plugin."""
 
 import base64
+import importlib.util
 import json
-import sys
 from pathlib import Path
 
-sys.path.insert(
-    0,
-    str(
-        Path(__file__).resolve().parents[3]
-        / "plugins.v2"
-        / "mteamadultsearch"
-    ),
+_PLUGIN_DIR = (
+    Path(__file__).resolve().parents[3] / "plugins.v3" / "mteamadultsearch"
 )
 
-from contracts import (  # noqa: E402
-    build_credential_enclosure,
-    build_search_payload,
-    normalize_av_keyword,
-)
+
+def _load_contracts():
+    spec = importlib.util.spec_from_file_location(
+        "mteamadultsearch_contracts_v3", _PLUGIN_DIR / "contracts.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+contracts = _load_contracts()
 
 
 def test_normalizes_common_av_number_separators():
-    assert normalize_av_keyword(" pred 879 ") == "PRED-879"
-    assert normalize_av_keyword("PRED_879") == "PRED-879"
+    assert contracts.normalize_av_keyword(" pred 879 ") == "PRED-879"
+    assert contracts.normalize_av_keyword("PRED_879") == "PRED-879"
 
 
 def test_builds_mteam_adult_search_payload():
-    assert build_search_payload("PRED-879", 1, 100) == {
+    assert contracts.build_search_payload("PRED-879", 1, 100) == {
         "keyword": "PRED-879",
         "mode": "adult",
         "categories": [],
@@ -38,7 +39,7 @@ def test_builds_mteam_adult_search_payload():
 
 
 def test_builds_moviepilot_credential_enclosure():
-    enclosure = build_credential_enclosure(
+    enclosure = contracts.build_credential_enclosure(
         api_url="https://api.m-team.cc/api",
         torrent_id="123",
         api_key="secret",
