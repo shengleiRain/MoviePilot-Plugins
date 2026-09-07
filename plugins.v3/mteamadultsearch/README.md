@@ -51,8 +51,8 @@ V3 宿主会优先读取 `package.v3.json` 并安装
 4. 在 `AV 下载目录` 中选择一个已配置目录，或选择使用 MoviePilot 默认目录。
 5. 按需开关 `提交成功后推送通知`，保存设置。
 
-插件自动绑定 M-Team `mTorrent` 站点，无需配置站点 ID。插件不会重复保存
-M-Team API Key。
+插件设置页的“支持的站点”只显示当前已适配的站点；目前为馒头/M-Team。可多选，
+留空表示使用全部已适配站点。插件不会重复保存 M-Team API Key。
 
 目录值使用 MoviePilot 的路径语义（本地 `/downloads/av` 或远端
 `rclone:/moviepilot/av`）。插件使用 MoviePilot 的目录 allowlist 校验保存
@@ -64,6 +64,7 @@ M-Team API Key。
 ```text
 POST /api/v1/plugin/MTeamAdultSearch/search
 POST /api/v1/plugin/MTeamAdultSearch/submit
+GET  /api/v1/plugin/MTeamAdultSearch/sites
 GET  /api/v1/plugin/MTeamAdultSearch/paths
 ```
 

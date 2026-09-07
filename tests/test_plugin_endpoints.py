@@ -114,6 +114,7 @@ def test_search_cache_prevents_repeat_upstream_calls(env):
     assert len(harness.RequestUtils.calls) == 1
     assert first.search_id != second.search_id
     assert [a.id for a in first.items] != [] and len(second.items) == 1
+    assert "site-api-key" not in repr(module.MTeamAdultSearch._search_cache)
 
 
 def test_free_keyword_search(env):
@@ -269,6 +270,56 @@ def test_submit_with_configured_save_path(env):
 
     assert result.save_path == "/downloads/av"
     assert harness.DownloadChain.calls[0]["save_path"] == "/downloads/av"
+
+
+def test_submit_reinserts_candidate_when_host_definitively_rejects(env):
+    module, plugin = env
+    _queue_search(harness.mteam_body([harness.make_row(7)], total=1))
+    response = plugin.search(module.SearchRequest(keyword="PRED-879"))
+    candidate_id = response.items[0].id
+    harness.DownloadChain.next_download_id = None
+
+    with pytest.raises(harness.HTTPException) as error:
+        plugin.submit(
+            module.SubmitRequest(
+                search_id=response.search_id, candidate_id=candidate_id
+            )
+        )
+
+    assert error.value.status_code == 422
+    assert "[download_rejected]" in error.value.detail
+    harness.DownloadChain.next_download_id = "dl-retry"
+    result = plugin.submit(
+        module.SubmitRequest(
+            search_id=response.search_id, candidate_id=candidate_id
+        )
+    )
+    assert result.submitted is True
+    assert result.download_id == "dl-retry"
+
+
+def test_sites_and_form_expose_only_supported_mteam_sites(env):
+    module, plugin = env
+
+    sites = plugin.sites()
+    assert [site.id for site in sites] == [1]
+    assert sites[0].name == "M-Team"
+    form, defaults = plugin.get_form()
+    assert defaults["site_ids"] == []
+    serialized = str(form)
+    assert "支持的站点" in serialized
+    assert "M-Team" in serialized
+
+
+def test_configured_unsupported_site_is_rejected(env):
+    module, plugin = env
+    plugin = harness.make_plugin(module, {"site_ids": [999]})
+
+    with pytest.raises(harness.HTTPException) as error:
+        plugin.sites()
+
+    assert error.value.status_code == 400
+    assert "[invalid_site_selection]" in error.value.detail
 
 
 def test_paths_lists_configured_dirs(env):

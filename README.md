@@ -57,11 +57,12 @@ MoviePilot 原生运行在 Windows 时，`PLUGIN_LOCAL_REPO_PATHS` 直接填写�
 ## 配置与使用
 
 1. 先在 MoviePilot 中配置 M-Team 站点，包含 API Access Token 和
-   `mTorrent` 解析器。插件自动绑定该站点，无需也不显示站点 ID。
+   `mTorrent` 解析器。插件设置页的“支持的站点”只显示已适配站点；当前为
+   馒头/M-Team，可多选，留空表示全部已适配站点。
 2. 在插件管理中启用 `M-Team 成人区番号搜索`。
 3. 先配置 MoviePilot 的下载目录；插件的 `AV 下载目录` 选择器只会列出已
    配置的下载根目录，可留空表示使用 MoviePilot 默认目录。
-4. 可选配置：M-Team API 地址（默认官方地址）、请求超时、
+4. 可选配置：支持的站点、M-Team API 地址（默认官方地址）、请求超时、
    `提交成功后推送通知` 开关（通过 MoviePilot 消息渠道推送）。
 5. 保存设置。无效或未配置的目录会在提交时被拒绝，插件详情页也会提示，
    并展示最近提交记录。
@@ -77,6 +78,7 @@ M-Team 爬虫；只暴露独立接口（`apikey` 鉴权，返回裸业务模型�
 ```text
 POST /api/v1/plugin/MTeamAdultSearch/search
 POST /api/v1/plugin/MTeamAdultSearch/submit
+GET  /api/v1/plugin/MTeamAdultSearch/sites
 GET  /api/v1/plugin/MTeamAdultSearch/paths
 ```
 

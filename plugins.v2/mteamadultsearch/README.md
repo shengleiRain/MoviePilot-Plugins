@@ -12,8 +12,8 @@
 
 ## 安装到 MoviePilot V2
 
-本项目是插件源码仓库，不是需要单独启动的服务。当前项目尚未发布到远程
-GitHub，因此本地测试有两种方式：
+本项目是插件源码仓库，不是需要单独启动的服务。远程市场地址为
+`https://github.com/shengleiRain/MoviePilot-Plugins`；本地测试也可使用以下方式：
 
 ### 本地插件仓测试
 
@@ -49,8 +49,8 @@ https://github.com/shengleiRain/MoviePilot-Plugins
 4. 在 `AV 下载目录` 中选择一个已配置目录，或选择使用 MoviePilot 默认目录。
 5. 按需开关 `提交成功后推送通知`，保存设置。
 
-插件自动绑定 M-Team `mTorrent` 站点，无需配置站点 ID。插件不会重复保存
-M-Team API Key。
+插件设置页的“支持的站点”只显示当前已适配的站点；目前为馒头/M-Team。可多选，
+留空表示使用全部已适配站点。插件不会重复保存 M-Team API Key。
 
 目录值使用 MoviePilot 的路径语义，例如：
 
@@ -67,6 +67,7 @@ rclone:/moviepilot/av
 ```text
 POST /api/v1/plugin/MTeamAdultSearch/search
 POST /api/v1/plugin/MTeamAdultSearch/submit
+GET  /api/v1/plugin/MTeamAdultSearch/sites
 GET  /api/v1/plugin/MTeamAdultSearch/paths
 ```
 

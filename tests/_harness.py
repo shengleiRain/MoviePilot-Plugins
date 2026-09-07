@@ -90,10 +90,46 @@ class DownloadChain:
     calls: list = []
     next_download_id = "dl-hash-1"
 
-    def download_single(self, context, **kwargs):
+    def download_single(
+        self,
+        context,
+        torrent_file=None,
+        torrent_content=None,
+        episodes=None,
+        channel=None,
+        source=None,
+        downloader=None,
+        save_path=None,
+        userid=None,
+        username=None,
+        label=None,
+        return_detail=False,
+        custom_words=None,
+    ):
         cls = type(self)
-        cls.calls.append({"context": context, **kwargs})
-        return cls.next_download_id
+        cls.calls.append(
+            {
+                "context": context,
+                "torrent_file": torrent_file,
+                "torrent_content": torrent_content,
+                "episodes": episodes,
+                "channel": channel,
+                "source": source,
+                "downloader": downloader,
+                "save_path": save_path,
+                "userid": userid,
+                "username": username,
+                "label": label,
+                "return_detail": return_detail,
+                "custom_words": custom_words,
+            }
+        )
+        if getattr(context.media_info, "data", {}).get("type") != MediaType.MOVIE:
+            raise AssertionError("MoviePilot download context must include media type")
+        return (
+            cls.next_download_id,
+            None if cls.next_download_id else "download rejected",
+        ) if return_detail else cls.next_download_id
 
 
 DOWNLOAD_DIRS = [
