@@ -118,9 +118,6 @@ class DirectoryHelper:
     def get_download_dirs(self):
         return list(DOWNLOAD_DIRS)
 
-    def validate_download_save_path(self, save_path: str) -> str:
-        return validate_download_save_path(save_path)
-
 
 class TorrentInfo:
     def __init__(self):

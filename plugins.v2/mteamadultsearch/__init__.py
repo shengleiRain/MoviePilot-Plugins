@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from app.chain.download import DownloadChain
 from app.core.context import Context, MediaInfo, TorrentInfo
 from app.core.metainfo import MetaInfo
-from app.helper.directory import DirectoryHelper
+from app.helper.directory import DirectoryHelper, validate_download_save_path
 from app.utils.http import RequestUtils
 from app.helper.sites import SitesHelper
 from app.plugins import _PluginBase
@@ -978,7 +978,7 @@ class MTeamAdultSearch(_PluginBase):
         value = self._string(self._config.get("save_path"))
         if not value:
             return None
-        return DirectoryHelper().validate_download_save_path(value)
+        return validate_download_save_path(value)
 
     def _timeout_seconds(self) -> int:
         value = self._int_value(self._config.get("timeout_seconds")) or 30
