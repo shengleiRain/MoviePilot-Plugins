@@ -172,7 +172,7 @@ class MTeamAdultSearch(_PluginBase):
     plugin_name = "M-Team 成人区番号搜索"
     plugin_desc = "独立调用 M-Team 成人区 API，支持 AV 番号搜索和 MoviePilot 下载。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleirain"
     plugin_config_prefix = "mteamadultsearch_"
