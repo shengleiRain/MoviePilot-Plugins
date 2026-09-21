@@ -30,6 +30,7 @@ from .contracts import (
     DEFAULT_API_BASE_URL,
     build_credential_enclosure,
     build_search_payload,
+    expand_search_keywords,
     normalize_search_keyword,
 )
 
@@ -538,11 +539,13 @@ class MTeamAdultSearch(_PluginBase):
         except ValueError as error:
             raise PluginApiError(400, "invalid_keyword", str(error)) from error
 
+        search_terms = expand_search_keywords(keyword)
+
         sites = self._resolve_sites(request.site_ids)
         sites_by_id = {int(site["id"]): site for site in sites}
         site_signature = tuple(int(site["id"]) for site in sites)
         cache_key = (
-            keyword,
+            tuple(search_terms),
             request.page,
             request.page_size,
             request.max_pages,
@@ -556,23 +559,36 @@ class MTeamAdultSearch(_PluginBase):
             fetched_rows = []
             totals: List[int] = []
             all_totals_known = True
+            seen_torrent_ids = set()
             try:
                 for site in sites:
-                    rows, site_total = self._fetch_rows(
-                        keyword=keyword,
-                        page=request.page,
-                        page_size=request.page_size,
-                        max_pages=request.max_pages,
-                        site=site,
-                    )
-                    fetched_rows.extend(
-                        _FetchedRow(raw=dict(row), site_id=int(site["id"]))
-                        for row in rows
-                    )
-                    if site_total is None:
-                        all_totals_known = False
+                    terms_to_query = search_terms[:2] if not is_av_number else search_terms[:1]
+                    site_total_sum = 0
+                    has_site_total = False
+                    for term in terms_to_query:
+                        rows, site_total = self._fetch_rows(
+                            keyword=term,
+                            page=request.page,
+                            page_size=request.page_size,
+                            max_pages=request.max_pages,
+                            site=site,
+                        )
+                        if site_total is not None:
+                            site_total_sum += site_total
+                            has_site_total = True
+                        for row in rows:
+                            tid = self._string(row.get("id"))
+                            if tid and tid in seen_torrent_ids:
+                                continue
+                            if tid:
+                                seen_torrent_ids.add(tid)
+                            fetched_rows.append(
+                                _FetchedRow(raw=dict(row), site_id=int(site["id"]))
+                            )
+                    if has_site_total:
+                        totals.append(site_total_sum)
                     else:
-                        totals.append(site_total)
+                        all_totals_known = False
             except ValueError as error:
                 raise PluginApiError(400, "invalid_api_url", str(error)) from error
             total = sum(totals) if all_totals_known else None

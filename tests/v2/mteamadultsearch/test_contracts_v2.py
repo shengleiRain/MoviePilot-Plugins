@@ -71,3 +71,25 @@ def test_builds_moviepilot_credential_enclosure():
     assert descriptor["method"] == "post"
     assert descriptor["params"] == {"id": "123"}
     assert descriptor["header"]["x-api-key"] == "secret"
+
+
+def test_expands_av_code_as_single_item():
+    assert contracts.expand_search_keywords("pred 879") == ["PRED-879"]
+
+
+def test_expands_actress_chinese_aliases():
+    terms = contracts.expand_search_keywords("三上悠亚")
+    assert terms[0] == "三上悠亜"
+
+    terms_aizawa = contracts.expand_search_keywords("相泽南")
+    assert terms_aizawa[0] == "相沢みなみ"
+
+    terms_kawakita = contracts.expand_search_keywords("河北彩花")
+    assert "河北彩花" in terms_kawakita
+    assert "河北彩伽" in terms_kawakita
+
+
+def test_converts_unlisted_simplified_kanji():
+    terms = contracts.expand_search_keywords("松下纱荣子")
+    assert terms[0] == "松下紗栄子"
+    assert "松下纱荣子" in terms

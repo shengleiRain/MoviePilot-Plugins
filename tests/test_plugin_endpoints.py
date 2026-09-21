@@ -128,6 +128,19 @@ def test_free_keyword_search(env):
     assert harness.RequestUtils.calls[0]["json"]["keyword"] == "Some Actor"
 
 
+def test_actress_chinese_alias_search(env):
+    module, plugin = env
+    _queue_search(harness.mteam_body([harness.make_row(101)], total=1))
+
+    response = plugin.search(module.SearchRequest(keyword="三上悠亚"))
+
+    assert response.is_av_number is False
+    assert response.keyword == "三上悠亚"
+    # Canonical Japanese name is prioritized for upstream search
+    assert harness.RequestUtils.calls[0]["json"]["keyword"] == "三上悠亜"
+
+
+
 def test_invalid_sort_rejected(env):
     module, plugin = env
     with pytest.raises(harness.HTTPException) as error:
