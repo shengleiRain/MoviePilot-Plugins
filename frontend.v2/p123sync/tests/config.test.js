@@ -69,3 +69,24 @@ it('persists each task monitoring strategy and stable interval', async () => {
   expect(request[1].config.tasks[0]).toMatchObject({trigger_mode:'directory',settle_seconds:120})
   wrapper.unmount()
 })
+
+it('round-trips the strict MD5 verification toggle', async () => {
+  const api={get:vi.fn(async()=>({enabled:true,passport:'',password:'',verify_md5:true,tasks:[]})),
+             post:vi.fn(async()=>({success:true,message:'已保存'}))}
+  const wrapper=mount(Config,{props:{api},global:{plugins:[createVuetify({components,directives})]}})
+  await flushPromises()
+  expect(wrapper.text()).toContain('严格MD5校验')
+  await wrapper.findAll('button').find(button=>button.text().trim()==='保存').trigger('click')
+  await flushPromises()
+  let request=api.post.mock.calls.find(call=>call[0].endsWith('/save_config'))
+  expect(request[1].config.verify_md5).toBe(true)
+  const strict=wrapper.findAllComponents({name:'VSwitch'}).find(component=>component.props('label')==='严格MD5校验')
+  expect(strict).toBeTruthy()
+  strict.vm.$emit('update:modelValue',false)
+  await flushPromises()
+  await wrapper.findAll('button').find(button=>button.text().trim()==='保存').trigger('click')
+  await flushPromises()
+  request=api.post.mock.calls.filter(call=>call[0].endsWith('/save_config'))
+  expect(request[1][1].config.verify_md5).toBe(false)
+  wrapper.unmount()
+})

@@ -34,6 +34,7 @@ class SyncJournal:
             self._conn.execute('CREATE TABLE IF NOT EXISTS files (run_id TEXT NOT NULL, file_key TEXT NOT NULL, position INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(run_id, file_key))')
             self._conn.execute('CREATE TABLE IF NOT EXISTS current_run (id INTEGER PRIMARY KEY CHECK(id=1), run_id TEXT NOT NULL)')
             self._conn.execute('CREATE TABLE IF NOT EXISTS monitor_files (pair_id TEXT NOT NULL, scope TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, changed_at REAL NOT NULL, present INTEGER NOT NULL DEFAULT 1, synced_size INTEGER, synced_mtime_ns INTEGER, retry_after REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(pair_id,scope,path))')
+            self._conn.execute('CREATE TABLE IF NOT EXISTS md5_cache (path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, md5 TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(path, size, mtime_ns))')
 
     def acquire(self) -> bool:
         """Nonblocking OS lock; the kernel releases it if the process dies."""
@@ -159,6 +160,20 @@ class SyncJournal:
                 (MONITOR_GIVE_UP_FAILURES, pair_id, scope)).fetchone()
             return {'observed': row[0] or 0, 'pending': row[1] or 0, 'missing': row[2] or 0,
                     'gave_up': row[3] or 0}
+
+    def md5_lookup(self, path: str, size: int, mtime_ns: int) -> Optional[str]:
+        """Cached digest for an unchanged source file (size+mtime_ns must match)."""
+        with self._lock:
+            row = self._conn.execute('SELECT md5 FROM md5_cache WHERE path=? AND size=? AND mtime_ns=?',
+                                     (path, size, mtime_ns)).fetchone()
+            return row[0] if row else None
+
+    def md5_store(self, path: str, size: int, mtime_ns: Optional[int], md5: str):
+        if mtime_ns is None:
+            return
+        with self._lock, self._conn:
+            self._conn.execute('INSERT OR REPLACE INTO md5_cache(path, size, mtime_ns, md5, updated_at) VALUES (?, ?, ?, ?, ?)',
+                               (path, size, mtime_ns, md5, time.time()))
 
     def load_latest(self) -> Optional[Dict]:
         with self._lock:

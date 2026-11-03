@@ -17,6 +17,7 @@ import os
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
@@ -198,19 +199,31 @@ def unique_keep_both_name(name: str, taken: Callable[[str], bool]) -> str:
             return candidate
 
 
-def plan_duplicate_action(local: LocalFile, remote: Dict, policy: str) -> SyncAction:
+def plan_duplicate_action(local: LocalFile, remote: Dict, policy: str,
+                          strict_verify: bool = False) -> SyncAction:
     """Plan one local file whose remote path holds several same-name copies.
 
     The engine never renames or deletes among duplicates: when the local file
-    matches at least one copy by size+md5 the content is already in the cloud
-    and the path is skipped (except for overwrite, which would leave a stray
-    copy behind); otherwise the file fails on its own with guidance to clean
-    the cloud directory.
+    matches at least one copy the content is already in the cloud and the path
+    is skipped (except for overwrite, which would leave a stray copy behind);
+    otherwise the file fails on its own with guidance to clean the cloud
+    directory. Strict verification matches copies by size+md5; the default
+    size-only mode treats any same-size copy as identical.
     """
+    candidates = remote.get("candidates") or []
+    if not strict_verify:
+        if policy != POLICY_OVERWRITE and any(int(c.get("size") or 0) == local.size
+                                              for c in candidates):
+            return SyncAction(kind="skip", local=local)
+        if policy != POLICY_OVERWRITE:
+            error = "云盘存在多个同名文件且大小均与本地不一致；请到云盘删除或改名多余副本后重试"
+        else:
+            error = "云盘存在多个同名文件，无法唯一确定覆盖目标；请到云盘删除多余副本后重试"
+        return SyncAction(kind="conflict", local=local, error=error)
     local_md5 = (local.md5 or "").lower()
     matched = any(local_md5 and c.get("md5") and str(c["md5"]).lower() == local_md5
                   and int(c.get("size") or 0) == local.size
-                  for c in remote.get("candidates") or [])
+                  for c in candidates)
     if matched and policy != POLICY_OVERWRITE:
         return SyncAction(kind="skip", local=local)
     if matched:
@@ -224,12 +237,18 @@ def plan_sync(
     local_files: List[LocalFile],
     remote_map: Dict[str, Dict],
     policy: str,
+    strict_verify: bool = False,
 ) -> List[SyncAction]:
     """Build the action list for one pair.
 
     ``remote_map`` maps relative posix path -> ``{"fileid": int, "size": int}``.
     Paths with several same-name remote copies carry ``{"ambiguous": True,
     "candidates": [...]}`` and are resolved by :func:`plan_duplicate_action`.
+
+    By default a same-name, same-size remote file is treated as identical and
+    skipped without hashing (matching the ``skip_same_size`` policy name);
+    ``strict_verify`` requires the legacy MD5 comparison instead and reports
+    ``unverified`` when no usable digest exists on either side.
     """
     actions: List[SyncAction] = []
     for local in local_files:
@@ -238,7 +257,7 @@ def plan_sync(
             actions.append(SyncAction(kind="upload", local=local))
             continue
         if remote.get("ambiguous"):
-            actions.append(plan_duplicate_action(local, remote, policy))
+            actions.append(plan_duplicate_action(local, remote, policy, strict_verify))
             continue
         same_size = int(remote.get("size") or 0) == local.size
         remote_args = {
@@ -247,6 +266,9 @@ def plan_sync(
             "remote_md5": remote.get("md5"),
         }
         if policy != POLICY_OVERWRITE and same_size:
+            if not strict_verify:
+                actions.append(SyncAction(kind="skip", local=local, **remote_args))
+                continue
             remote_md5 = remote.get("md5")
             if not remote_md5 or not local.md5:
                 actions.append(SyncAction(kind="unverified", local=local,
@@ -624,6 +646,10 @@ class RunState:
 class SyncEngine:
     """Executes one sync run for a list of pairs against one client."""
 
+    # Worker threads for strict-mode MD5 pre-verification (hashlib releases the
+    # GIL on large updates, so threads overlap disk IO with hashing).
+    VERIFY_THREADS = 4
+
     def __init__(
         self,
         client: "P123SyncClient",
@@ -632,6 +658,8 @@ class SyncEngine:
         state: RunState,
         tick_interval: float = 1.0,
         monitor_scopes: Optional[Dict[str, str]] = None,
+        journal=None,
+        verify_md5: bool = False,
     ):
         self.client = client
         self.log = logger
@@ -641,6 +669,8 @@ class SyncEngine:
         self._dir_cache: Dict[str, int] = {}
         self._reserved_paths = set()
         self._monitor_scopes = monitor_scopes or {}
+        self._journal = journal
+        self._verify_md5 = verify_md5
 
     # ---------------------------------------------------------------- public
 
@@ -818,23 +848,26 @@ class SyncEngine:
         remote_map = self._build_remote_map(pair)
         self.log(f"[{pair.name}] 远端列举完成: {len(remote_map)} 个文件")
 
-        for local in local_files:
-            remote = remote_map.get(local.rel_path)
-            if remote is not None and remote.get("ambiguous"):
-                # Hash once so plan_duplicate_action can match against every
-                # same-name copy; sizes that already differ cannot match.
-                candidates = remote.get("candidates") or []
-                if any(int(c.get("size") or 0) == local.size and c.get("md5")
-                       for c in candidates):
-                    self.state.pair_update(pair.id, current=f"校验 {local.rel_path}")
-                    self._hash_source(local)
-                continue
-            if (pair.policy != POLICY_OVERWRITE and remote and remote.get("size") == local.size
-                    and remote.get("md5")):
-                self.state.pair_update(pair.id, current=f"校验 {local.rel_path}")
-                local.md5 = self._hash_source(local)
+        if self._verify_md5:
+            # Strict mode only: in the default size-only mode every same-size
+            # file skips without hashing, so there is nothing to pre-verify.
+            to_verify: List[LocalFile] = []
+            for local in local_files:
+                remote = remote_map.get(local.rel_path)
+                if remote is not None and remote.get("ambiguous"):
+                    # Hash once so plan_duplicate_action can match against every
+                    # same-name copy; sizes that already differ cannot match.
+                    candidates = remote.get("candidates") or []
+                    if any(int(c.get("size") or 0) == local.size and c.get("md5")
+                           for c in candidates):
+                        to_verify.append(local)
+                    continue
+                if (pair.policy != POLICY_OVERWRITE and remote and remote.get("size") == local.size
+                        and remote.get("md5")):
+                    to_verify.append(local)
+            self._verify_hashes(pair, to_verify)
 
-        actions = plan_sync(local_files, remote_map, pair.policy)
+        actions = plan_sync(local_files, remote_map, pair.policy, self._verify_md5)
         if retry_paths is None:
             self.state.add_files([
                 {
@@ -873,7 +906,7 @@ class SyncEngine:
                         done += 1
                         self.state.pair_update(pair.id, done=done)
                 elif action.kind == "skip":
-                    self._hash_source(action.local)
+                    self._confirm_unchanged(action.local)
                     skipped += 1
                     self.state.mark_file(key, FILE_SKIPPED, percent=100.0)
                     self.state.add_skipped_bytes(action.local.size)
@@ -897,18 +930,80 @@ class SyncEngine:
                 self.log(f"[{pair.name}] 失败 {action.local.rel_path}: {err}")
         self.state.pair_update(pair.id, phase=PHASE_FINISHED, current="")
 
+    def _verify_hashes(self, pair: TaskPairConfig, files: List[LocalFile]):
+        """Hash pending files (optionally in parallel) with visible progress."""
+        total = len(files)
+        if not total:
+            return
+        if total == 1 or self.VERIFY_THREADS <= 1:
+            for index, local in enumerate(files, 1):
+                self.state.pair_update(pair.id, current=f"校验 {index}/{total} {local.rel_path}")
+                self._hash_source(local)
+            return
+        done = 0
+        first_error: Optional[BaseException] = None
+        executor = ThreadPoolExecutor(max_workers=min(self.VERIFY_THREADS, total),
+                                      thread_name_prefix="p123sync-verify")
+        try:
+            futures = {executor.submit(self._hash_source, local): local for local in files}
+            for future in as_completed(futures):
+                local = futures[future]
+                try:
+                    future.result()
+                except BaseException as err:  # noqa: BLE001 - fail the pair like the serial loop
+                    if first_error is None:
+                        first_error = err
+                        for pending in futures:
+                            pending.cancel()
+                    continue
+                done += 1
+                self.state.pair_update(pair.id, current=f"校验 {done}/{total} {local.rel_path}")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if first_error is not None:
+            raise first_error
+
     def _hash_source(self, local: LocalFile) -> str:
         if self._cancelled():
             raise KeyboardInterrupt
         before = local.abs_path.stat()
         if before.st_size != local.size or (local.mtime_ns is not None and before.st_mtime_ns != local.mtime_ns):
             raise RuntimeError(f"源文件在扫描后发生变化: {local.rel_path}")
-        digest = local.md5 or self.client._file_md5(local.abs_path, self._cancelled)
+        digest = local.md5
+        if digest is None and self._journal is not None and local.mtime_ns is not None:
+            # A cached digest for the same path+size+mtime_ns means the bytes
+            # have not changed since they were last read; skip the full read.
+            try:
+                digest = self._journal.md5_lookup(str(local.abs_path), local.size, local.mtime_ns)
+            except Exception:
+                digest = None
+        if digest is None:
+            digest = self.client._file_md5(local.abs_path, self._cancelled)
+            if self._journal is not None and local.mtime_ns is not None:
+                try:
+                    self._journal.md5_store(str(local.abs_path), local.size, local.mtime_ns, digest)
+                except Exception:
+                    pass  # the cache is an accelerator, never a gate
         after = local.abs_path.stat()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise RuntimeError(f"源文件在校验期间发生变化: {local.rel_path}")
         local.md5 = digest
         return digest
+
+    def _confirm_unchanged(self, local: LocalFile) -> None:
+        """Stat-only liveness check for files already proven identical remotely.
+
+        Skips decided by name+size never need a digest, but the file must still
+        be the one that was scanned (size+mtime unchanged, still readable).
+        """
+        if self._cancelled():
+            raise KeyboardInterrupt
+        before = local.abs_path.stat()
+        if before.st_size != local.size or (local.mtime_ns is not None and before.st_mtime_ns != local.mtime_ns):
+            raise RuntimeError(f"源文件在扫描后发生变化: {local.rel_path}")
+        after = local.abs_path.stat()
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise RuntimeError(f"源文件在校验期间发生变化: {local.rel_path}")
 
     @staticmethod
     def _find_name(items, name):

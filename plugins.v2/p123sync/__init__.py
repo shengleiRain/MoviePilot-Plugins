@@ -62,6 +62,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "password": "",
     "cron": "",
     "notify": True,
+    "verify_md5": False,
     "tasks": [],
 }
 
@@ -93,9 +94,9 @@ class P123Sync(_PluginBase):
     """One-way 123 cloud drive folder sync with a visual AppPage."""
 
     plugin_name = "123云盘同步"
-    plugin_desc = "本地目录同步到123云盘：支持手动、目录监控及下载器监控，内容校验、安全覆盖与中断恢复。"
+    plugin_desc = "本地目录同步到123云盘：支持手动、目录监控及下载器监控，大小一致快速跳过、可选MD5严格校验、安全覆盖与中断恢复。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -109,6 +110,7 @@ class P123Sync(_PluginBase):
         self._password = ""
         self._cron = ""
         self._notify = True
+        self._verify_md5 = False
         self._pairs: List[TaskPairConfig] = []
         self._client: Optional[P123SyncClient] = None
         self._state = RunState(trigger="manual")
@@ -229,6 +231,7 @@ class P123Sync(_PluginBase):
         self._password = str(config.get("password") or "")
         self._cron = str(config.get("cron") or "").strip()
         self._notify = bool(config.get("notify", True))
+        self._verify_md5 = bool(config.get("verify_md5"))
         self._pairs = [TaskPairConfig.from_dict(task) for task in (config.get("tasks") or [])
                        if isinstance(task, dict) and (task.get("source_path") or "").strip()]
         self._client = None
@@ -465,7 +468,7 @@ class P123Sync(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
         """Vue federated frontend with a versioned asset directory."""
-        return "vue", "dist/v1_6_0"
+        return "vue", "dist/v1_7_0"
 
     def get_dashboard(self, key: str = "", user_agent: str = None) -> Tuple[dict, dict, None]:
         """Register the federated Dashboard with the MoviePilot host."""
@@ -663,6 +666,7 @@ class P123Sync(_PluginBase):
             "password": self._password,
             "cron": self._cron,
             "notify": self._notify,
+            "verify_md5": self._verify_md5,
             "tasks": [
                 {
                     "id": pair.id,
@@ -683,6 +687,7 @@ class P123Sync(_PluginBase):
         config = dict(DEFAULT_CONFIG)
         config.update(raw or {})
         config['cron'] = str(config.get('cron') or '').strip()
+        config['verify_md5'] = bool(config.get('verify_md5'))
         if config['cron']:
             try:
                 CronTrigger.from_crontab(config['cron'])
@@ -1157,6 +1162,8 @@ class P123Sync(_PluginBase):
                 state=state,
                 monitor_scopes={p.id: scope_for(p, self._passport) for p in pairs
                                 if p.trigger_mode != TRIGGER_MANUAL},
+                journal=self._journal,
+                verify_md5=self._verify_md5,
             )
             engine.run(pairs, retry_paths=retry_paths, already_started=True, selected_paths=selected_paths)
         except Exception as err:  # noqa: BLE001

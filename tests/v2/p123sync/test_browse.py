@@ -88,8 +88,8 @@ def test_root_source_is_preserved(plugin_module):
 
 def test_versioned_frontend_and_dashboard_registration(plugin_module):
     plugin = plugin_module.P123Sync()
-    assert plugin.plugin_version == '1.6.0'
-    assert plugin.get_render_mode() == ('vue', 'dist/v1_6_0')
+    assert plugin.plugin_version == '1.7.0'
+    assert plugin.get_render_mode() == ('vue', 'dist/v1_7_0')
     assert plugin.get_dashboard() == ({'cols': 12, 'md': 6}, {'border': False}, None)
 
 
@@ -455,13 +455,13 @@ def test_upload_put_http_failure_is_not_reported_as_success(plugin_module):
 def test_release_zip_contains_only_current_plugin_sources_and_assets(tmp_path):
     import subprocess, sys, zipfile
     root = Path(__file__).resolve().parents[3]
-    output = tmp_path / 'p123sync_v1.6.0.zip'
+    output = tmp_path / 'p123sync_v1.7.0.zip'
     subprocess.run([sys.executable, str(root / '.github/scripts/package_p123sync_release.py'), str(output)],
                    cwd=root, check=True, capture_output=True, text=True)
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
-        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_6_0/remoteEntry.js' in names
-        assert all(not name.startswith(('dist/assets/', 'dist/v1_4_0/', 'dist/v1_5_0/')) for name in names)
+        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_7_0/remoteEntry.js' in names
+        assert all(not name.startswith(('dist/assets/', 'dist/v1_4_0/', 'dist/v1_5_0/', 'dist/v1_6_0/')) for name in names)
         assert not any('__pycache__' in name or name.endswith('.sqlite3') for name in names)
         assert archive.testzip() is None
 

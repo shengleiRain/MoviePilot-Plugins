@@ -68,7 +68,7 @@ export const FILE_STATE_COLOR = {
 }
 
 export const POLICY_TEXT = {
-  skip_same_size: '内容一致时跳过',
+  skip_same_size: '大小一致时跳过',
   overwrite: '覆盖（旧文件进回收站）',
   keep_both: '保留两者（自动改名）',
 }

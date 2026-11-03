@@ -29,6 +29,12 @@
           <v-switch v-model="config.notify" label="同步完成发送通知" color="primary" hide-details density="compact" />
           <v-btn variant="tonal" color="primary" size="small" :loading="testing" @click="testLogin">验证登录</v-btn>
         </v-col>
+        <v-col cols="12" sm="6" class="d-flex align-center flex-wrap ga-3">
+          <v-switch v-model="config.verify_md5" label="严格MD5校验" color="primary" hide-details density="compact" />
+          <span class="text-caption text-medium-emphasis" style="max-width: 26rem;">
+            默认关闭：同名同大小直接跳过，速度快。开启后跳过前仍读取文件比对MD5（更慢更严格）。上传与安全覆盖始终校验MD5。
+          </span>
+        </v-col>
       </v-row>
 
       <v-divider class="my-5" />
@@ -36,7 +42,7 @@
         <div class="text-subtitle-1 font-weight-medium">同步任务</div><v-spacer />
         <v-btn size="small" variant="tonal" color="primary" prepend-icon="mdi-plus" @click="addTask">添加任务</v-btn>
       </div>
-      <div class="text-body-2 text-medium-emphasis mb-4">源目录使用 MoviePilot 容器内路径；目标目录不存在时会自动创建。同名文件需校验内容后才会跳过。隐藏文件、下载临时文件和系统垃圾会被忽略。</div>
+      <div class="text-body-2 text-medium-emphasis mb-4">源目录使用 MoviePilot 容器内路径；目标目录不存在时会自动创建。同名且大小一致的文件默认直接跳过；如需逐文件比对MD5，请开启严格MD5校验。隐藏文件、下载临时文件和系统垃圾会被忽略。</div>
 
       <v-card v-for="(task, index) in config.tasks" :key="task._key" variant="outlined" class="mb-3">
         <v-card-text>
@@ -109,7 +115,7 @@ const props = defineProps({
 })
 
 const policyItems = [
-  { title: '内容一致时跳过（推荐）', value: 'skip_same_size' },
+  { title: '大小一致时跳过（推荐）', value: 'skip_same_size' },
   { title: '覆盖（旧文件进回收站）', value: 'overwrite' },
   { title: '保留两者（自动改名）', value: 'keep_both' },
 ]
@@ -120,7 +126,7 @@ const triggerItems = [
 ]
 
 let taskKeySeq = 1
-const config = reactive({ enabled: false, passport: '', password: '', cron: '', notify: true, tasks: [] })
+const config = reactive({ enabled: false, passport: '', password: '', cron: '', notify: true, verify_md5: false, tasks: [] })
 const loading = ref(false)
 const saving = ref(false)
 const testing = ref(false)
@@ -185,6 +191,7 @@ async function load() {
     config.password = remote?.password || ''
     config.cron = remote?.cron || ''
     config.notify = remote?.notify !== false
+    config.verify_md5 = !!remote?.verify_md5
     config.tasks = (remote?.tasks || []).map(normalizeTask)
     await nextTick()
     if (config.passport && config.password && !space.value) void refreshSpace()
@@ -210,6 +217,7 @@ function buildPayload() {
     password: config.password,
     cron: String(config.cron || '').trim(),
     notify: config.notify,
+    verify_md5: config.verify_md5,
     tasks: config.tasks.map(task => ({
       id: task.id || undefined,
       name: task.name,

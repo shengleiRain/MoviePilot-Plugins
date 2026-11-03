@@ -131,6 +131,18 @@ class FakeClient:
         return self.next_id, False
 
 
+class CountingClient(FakeClient):
+    """FakeClient that counts how often local files are actually read for MD5."""
+
+    def __init__(self, remote: dict | None = None):
+        super().__init__(remote)
+        self.hash_calls = 0
+
+    def _file_md5(self, path, cancel_check=None):
+        self.hash_calls += 1
+        return super()._file_md5(path, cancel_check)
+
+
 def make_pair(tmp_path: Path, **overrides) -> "engine_mod.TaskPairConfig":
     defaults = dict(
         id="t1",
@@ -562,12 +574,16 @@ def test_lost_upload_response_is_reconciled_without_duplicate(local_tree):
     assert len(client.uploads) == 1 and client.trashed == [503]
 
 
-def test_same_size_different_content_is_not_silently_skipped():
+def test_same_size_different_content_size_mode_skips_strict_overwrites():
     local = engine_mod.LocalFile('a.mkv', Path('/unused'), 5, md5='a' * 32)
     remote = {'a.mkv': {'fileid': 1, 'size': 5, 'md5': 'b' * 32}}
-    assert engine_mod.plan_sync([local], remote, engine_mod.POLICY_SKIP_SAME_SIZE)[0].kind == 'overwrite'
-    assert engine_mod.plan_sync([local], remote, engine_mod.POLICY_KEEP_BOTH)[0].kind == 'keep_both'
-    assert engine_mod.plan_sync([local], {'a.mkv': {'fileid':1,'size':5}}, engine_mod.POLICY_SKIP_SAME_SIZE)[0].kind == 'unverified'
+    # default size-only mode: same name+size is treated as identical
+    assert engine_mod.plan_sync([local], remote, engine_mod.POLICY_SKIP_SAME_SIZE)[0].kind == 'skip'
+    # strict mode keeps the MD5-verified semantics
+    assert engine_mod.plan_sync([local], remote, engine_mod.POLICY_SKIP_SAME_SIZE, strict_verify=True)[0].kind == 'overwrite'
+    assert engine_mod.plan_sync([local], remote, engine_mod.POLICY_KEEP_BOTH, strict_verify=True)[0].kind == 'keep_both'
+    assert engine_mod.plan_sync([local], {'a.mkv': {'fileid':1,'size':5}},
+                                engine_mod.POLICY_SKIP_SAME_SIZE, strict_verify=True)[0].kind == 'unverified'
 
 
 def test_scan_reports_inaccessible_subdirectory(monkeypatch, local_tree):
@@ -757,12 +773,25 @@ def test_lost_promotion_response_is_reconciled_before_old_copy_is_trashed(local_
     assert state.snapshot()['counters']['failed'] == 0
 
 
-def test_remote_missing_md5_never_claims_same_size_is_equal(local_tree):
+def test_size_mode_skips_without_hashing_or_failing_on_missing_remote_md5(local_tree):
+    remote = _populated_remote()
+    remote['2'][0].digest = None   # a.txt has no usable Etag on the remote
+    client = CountingClient(remote=remote)
+    pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
+    state, _ = run_engine(client, [pair])
+    snap = state.snapshot()
+    assert snap['counters']['skipped'] == 3 and snap['counters']['failed'] == 0
+    assert client.hash_calls == 0 and not client.uploads and not client.trashed
+
+
+def test_strict_verify_still_fails_on_missing_remote_md5(local_tree):
     remote = _populated_remote()
     remote['2'][0].digest = None
     client = FakeClient(remote=remote)
     pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
-    state, _ = run_engine(client, [pair])
+    state = engine_mod.RunState()
+    engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state,
+                          verify_md5=True).run([pair])
     snap = state.snapshot()
     assert snap['counters']['failed'] == 1 and snap['counters']['skipped'] == 2
     assert not client.uploads and not client.trashed
@@ -1007,6 +1036,83 @@ def test_incorrect_staged_hash_never_moves_or_trashes_old_file(local_tree):
     assert any(item.file_id == 503 and item.name == 'a.txt' for item in client.remote['2'])
 
 
+# ------------------------------------------------------------- md5 cache
+
+def _make_journal(tmp_path: Path, name: str):
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location(f'p123sync_journal_md5_{name.replace(".", "_")}',
+                                                  _PLUGIN_DIR / 'sync_journal.py')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.SyncJournal(tmp_path / name)
+
+
+def test_md5_cache_avoids_rereading_unchanged_files(tmp_path, local_tree):
+    journal = _make_journal(tmp_path, 'md5.sqlite3')
+    pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
+    # strict run #1 hashes every same-size file once and fills the cache
+    client = CountingClient(remote=_populated_remote())
+    state = engine_mod.RunState(journal=journal)
+    engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state,
+                          journal=journal, verify_md5=True).run([pair])
+    assert client.hash_calls == 3
+    assert state.snapshot()['counters']['skipped'] == 3
+    # strict run #2 (new process/journal handle, same cache) reads no bytes
+    journal.close()
+    journal = _make_journal(tmp_path, 'md5.sqlite3')
+    client2 = CountingClient(remote=_populated_remote())
+    state2 = engine_mod.RunState(journal=journal)
+    engine_mod.SyncEngine(client2, lambda _: None, threading.Event(), state2,
+                          journal=journal, verify_md5=True).run([pair])
+    assert client2.hash_calls == 0
+    assert state2.snapshot()['counters']['skipped'] == 3
+    journal.close()
+
+
+def test_md5_cache_invalidated_when_file_changes(tmp_path, local_tree):
+    journal = _make_journal(tmp_path, 'md5b.sqlite3')
+    client = CountingClient()
+    eng = engine_mod.SyncEngine(client, lambda _: None, threading.Event(),
+                                engine_mod.RunState(), journal=journal)
+    target = local_tree / 'a.txt'
+    local1 = engine_mod.LocalFile('a.txt', target, target.stat().st_size,
+                                  mtime_ns=target.stat().st_mtime_ns)
+    assert eng._hash_source(local1) == hashlib.md5(b'aaa').hexdigest()
+    assert client.hash_calls == 1
+    # same size+mtime_ns -> served from the cache even for a fresh LocalFile
+    local2 = engine_mod.LocalFile('a.txt', target, target.stat().st_size,
+                                  mtime_ns=target.stat().st_mtime_ns)
+    assert eng._hash_source(local2) == hashlib.md5(b'aaa').hexdigest()
+    assert client.hash_calls == 1
+    # a content change updates mtime_ns -> re-read and refresh the cache
+    target.write_bytes(b'zzz')
+    local3 = engine_mod.LocalFile('a.txt', target, target.stat().st_size,
+                                  mtime_ns=target.stat().st_mtime_ns)
+    assert eng._hash_source(local3) == hashlib.md5(b'zzz').hexdigest()
+    assert client.hash_calls == 2
+    journal.close()
+
+
+def test_verify_hashes_runs_parallel_with_progress(local_tree):
+    client = CountingClient()
+    pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
+    state = engine_mod.RunState()
+    state.begin([pair])
+    eng = engine_mod.SyncEngine(client, lambda _: None, threading.Event(),
+                                state, verify_md5=True)
+    files = []
+    for rel in ('a.txt', 'Season 1/e01.mkv', 'Season 1/e02.mkv'):
+        path = local_tree / rel
+        files.append(engine_mod.LocalFile(rel, path, path.stat().st_size,
+                                          mtime_ns=path.stat().st_mtime_ns))
+    eng._verify_hashes(pair, files)
+    assert client.hash_calls == 3
+    assert all(local.md5 for local in files)
+    assert state.snapshot()['pairs']['t1']['current'] == '校验 3/3 Season 1/e02.mkv' or \
+           state.snapshot()['pairs']['t1']['current'].startswith('校验 3/3')
+
+
 # ------------------------------------------------------- duplicate remote names
 
 def test_plan_sync_resolves_ambiguous_duplicate_by_md5():
@@ -1023,25 +1129,28 @@ def test_plan_sync_resolves_ambiguous_duplicate_by_md5():
     assert action.kind == 'conflict' and '覆盖' in action.error
 
 
-def test_plan_sync_conflicts_when_duplicate_differs_from_local():
+def test_plan_sync_duplicate_differs_by_md5_size_mode_skips_strict_conflicts():
     local = engine_mod.LocalFile('books/x.pdf', Path('x'), 5,
                                  md5=hashlib.md5(b'local').hexdigest())
     remote = {'books/x.pdf': {'ambiguous': True, 'candidates': [
         {'fileid': 1, 'size': 5, 'md5': hashlib.md5(b'other1').hexdigest()},
         {'fileid': 2, 'size': 7, 'md5': hashlib.md5(b'other2').hexdigest()}]}}
+    # size-only mode: a same-size copy is presumed identical without hashing
+    assert engine_mod.plan_sync([local], remote, engine_mod.POLICY_SKIP_SAME_SIZE)[0].kind == 'skip'
     for policy in engine_mod.POLICIES:
-        action = engine_mod.plan_sync([local], remote, policy)[0]
+        action = engine_mod.plan_sync([local], remote, policy, strict_verify=True)[0]
         assert action.kind == 'conflict'
         assert '同名' in action.error and '云盘' in action.error
 
 
-def test_plan_sync_conflicts_when_duplicate_lacks_digest():
+def test_plan_sync_duplicate_lacks_digest_size_mode_skips_strict_conflicts():
     local = engine_mod.LocalFile('books/x.pdf', Path('x'), 5, md5=None)
     remote = {'books/x.pdf': {'ambiguous': True,
                               'candidates': [{'fileid': 1, 'size': 5, 'md5': None}]}}
-    action = engine_mod.plan_sync([local], remote,
-                                  engine_mod.POLICY_SKIP_SAME_SIZE)[0]
-    assert action.kind == 'conflict'
+    assert engine_mod.plan_sync([local], remote,
+                                engine_mod.POLICY_SKIP_SAME_SIZE)[0].kind == 'skip'
+    assert engine_mod.plan_sync([local], remote,
+                                engine_mod.POLICY_SKIP_SAME_SIZE, strict_verify=True)[0].kind == 'conflict'
 
 
 def test_build_remote_map_collects_duplicate_names(local_tree):
@@ -1081,8 +1190,8 @@ def test_engine_duplicate_identical_copy_skips_and_rest_still_syncs(local_tree):
     assert client.uploads == [] and not client.trashed
 
 
-def test_engine_duplicate_conflict_fails_only_that_file(local_tree):
-    client = FakeClient(remote={
+def test_engine_duplicate_size_mode_skips_by_size_strict_conflicts(local_tree):
+    remote = {
         '0': [FakeItem(1, 'test', 1)],
         '1': [FakeItem(2, 'target', 1)],
         '2': [FakeItem(503, 'a.txt', 0, 3, hashlib.md5(b'old-one').hexdigest()),
@@ -1090,9 +1199,19 @@ def test_engine_duplicate_conflict_fails_only_that_file(local_tree):
               FakeItem(500, 'Season 1', 1)],
         '500': [FakeItem(501, 'e01.mkv', 0, 100, hashlib.md5(b'x' * 100).hexdigest()),
                 FakeItem(502, 'e02.mkv', 0, 200, hashlib.md5(b'y' * 200).hexdigest())],
-    })
+    }
     pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
+    # size-only mode: the size-3 copy is presumed identical, no failure
+    client = FakeClient(remote=remote)
     state, summary = run_engine(client, [pair])
+    snap = state.snapshot()
+    assert summary['phase'] == engine_mod.PHASE_FINISHED
+    assert snap['counters']['failed'] == 0 and snap['counters']['skipped'] == 3
+    # strict mode: MD5 mismatch against both copies -> single-file conflict
+    client = FakeClient(remote=remote)
+    state = engine_mod.RunState()
+    summary = engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state,
+                                    verify_md5=True).run([pair])
     snap = state.snapshot()
     assert summary['phase'] == engine_mod.PHASE_FINISHED
     assert snap['counters']['failed'] == 1 and snap['counters']['skipped'] == 2
