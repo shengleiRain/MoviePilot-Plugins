@@ -83,7 +83,7 @@ class P123Sync(_PluginBase):
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录单向同步到123云盘：免识别整树复制、同名策略可配、秒传/分片上传，侧栏页面实时查看任务与进度。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
