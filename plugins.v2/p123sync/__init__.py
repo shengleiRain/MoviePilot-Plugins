@@ -18,6 +18,7 @@ Key design:
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
@@ -65,13 +66,19 @@ class SaveConfigRequest(BaseModel):
     config: Dict[str, Any]
 
 
+class BrowseRequest(BaseModel):
+    path: str = "/"
+    passport: str = ""
+    password: str = ""
+
+
 class P123Sync(_PluginBase):
     """One-way 123 cloud drive folder sync with a visual AppPage."""
 
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录单向同步到123云盘：免识别整树复制、同名策略可配、秒传/分片上传，侧栏页面实时查看任务与进度。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -89,6 +96,9 @@ class P123Sync(_PluginBase):
         self._client: Optional[P123SyncClient] = None
         self._state = RunState(trigger="manual")
         self._run_lock = threading.Lock()
+        self._browse_lock = threading.Lock()
+        self._browse_client: Optional[P123SyncClient] = None
+        self._browse_credentials = None
         self._cancel_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
 
@@ -172,6 +182,20 @@ class P123Sync(_PluginBase):
                 "summary": "保存插件配置",
             },
             {
+                "path": "/browse_local",
+                "endpoint": self.api_browse_local,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "浏览容器内本地目录",
+            },
+            {
+                "path": "/browse_remote",
+                "endpoint": self.api_browse_remote,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "浏览123云盘目录",
+            },
+            {
                 "path": "/test_login",
                 "endpoint": self.api_test_login,
                 "methods": ["POST"],
@@ -227,6 +251,12 @@ class P123Sync(_PluginBase):
             worker.join(timeout=10)
         self._cancel_event = threading.Event()
         self._worker = None
+        with self._browse_lock:
+            browse_client = self._browse_client
+            self._browse_client = None
+            self._browse_credentials = None
+            if browse_client is not None:
+                browse_client.client.close()
         client = self._client
         self._client = None
         if client is not None:
@@ -303,11 +333,64 @@ class P123Sync(_PluginBase):
         self.init_plugin(config)
         return {"success": True}
 
-    def api_test_login(self) -> Dict[str, Any]:
+    def api_browse_local(self, request: BrowseRequest) -> Dict[str, Any]:
         try:
-            client = self._get_client()
-            ok, message = client.login_ok()
-        except Exception as err:  # noqa: BLE001 - surface any login failure
+            path = Path(request.path or "/")
+            if not path.is_absolute():
+                raise ValueError("请输入绝对路径")
+            path = path.resolve(strict=True)
+            if not path.is_dir():
+                raise ValueError("路径不是目录")
+            folders = sorted((entry.name for entry in path.iterdir() if entry.is_dir()),
+                             key=str.casefold)
+            return {"success": True, "path": path.as_posix(), "folders": folders}
+        except (OSError, ValueError, RuntimeError) as err:
+            return {"success": False, "message": f"无法读取本地目录：{err}"}
+
+    def api_browse_remote(self, request: BrowseRequest) -> Dict[str, Any]:
+        if not request.passport or not request.password:
+            return {"success": False, "message": "请先填写123云盘账号和密码"}
+        segments = [segment for segment in request.path.split("/") if segment]
+        if any(segment in (".", "..") for segment in segments):
+            return {"success": False, "message": "云盘路径不能包含 . 或 .."}
+        try:
+            # Use a separate, serialized session so browsing never closes or
+            # races the client used by an active synchronization.
+            with self._browse_lock:
+                credentials = (request.passport, request.password)
+                if self._browse_credentials != credentials:
+                    if self._browse_client is not None:
+                        self._browse_client.client.close()
+                    self._browse_client = P123SyncClient(*credentials)
+                    self._browse_credentials = credentials
+                client = self._browse_client
+                current_id = 0
+                for segment in segments:
+                    folder = next((item for item in client.list_dir(current_id)
+                                   if item.is_dir and item.name == segment), None)
+                    if folder is None:
+                        raise FileNotFoundError(f"云盘目录不存在：{segment}")
+                    current_id = folder.file_id
+                folders = sorted((item.name for item in client.list_dir(current_id)
+                                  if item.is_dir), key=str.casefold)
+            return {"success": True, "path": "/" + "/".join(segments), "folders": folders}
+        except Exception as err:  # surface login, network, and listing errors
+            return {"success": False, "message": f"无法读取云盘目录：{err}"}
+
+    def api_test_login(self, request: BrowseRequest = Body(default=None)) -> Dict[str, Any]:
+        # Verify the entered credentials without saving settings or interrupting a run.
+        credentials = (request.passport, request.password) if request else (self._passport, self._password)
+        if not all(credentials):
+            return {"success": False, "message": "请先填写123云盘账号和密码"}
+        try:
+            with self._browse_lock:
+                if self._browse_credentials != credentials:
+                    if self._browse_client is not None:
+                        self._browse_client.client.close()
+                    self._browse_client = P123SyncClient(*credentials)
+                    self._browse_credentials = credentials
+                ok, message = self._browse_client.login_ok()
+        except Exception as err:
             return {"success": False, "message": str(err)}
         return {"success": ok, "message": message}
 

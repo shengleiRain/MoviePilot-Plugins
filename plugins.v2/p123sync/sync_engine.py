@@ -58,6 +58,15 @@ JUNK_NAMES = ("thumbs.db", "desktop.ini")
 MAX_TRACKED_FILES = 5000
 
 
+def _normalize_source_path(path: str) -> str:
+    trimmed = path.rstrip("/")
+    if path and not trimmed:
+        return "/"
+    if path.endswith("/") and len(trimmed) == 2 and trimmed[1] == ":":
+        return trimmed + "/"
+    return trimmed
+
+
 @dataclass
 class TaskPairConfig:
     """One configured source->target pair."""
@@ -82,7 +91,7 @@ class TaskPairConfig:
         return cls(
             id=str(data.get("id") or uuid.uuid4().hex[:8]),
             name=str(data.get("name") or data.get("source_path") or ""),
-            source_path=str(data.get("source_path") or "").rstrip("/"),
+            source_path=_normalize_source_path(str(data.get("source_path") or "")),
             target_path="/" + str(data.get("target_path") or "/").strip("/"),
             policy=policy,
             exclude_ext=exts,

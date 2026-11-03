@@ -1,97 +1,75 @@
 <template>
   <v-card class="p123sync-config">
     <v-card-text>
-      <v-alert v-if="message" :type="message.type" density="compact" class="mb-3">
-        {{ message.text }}
-      </v-alert>
+      <v-alert v-if="message" :type="message.type" density="compact" class="mb-4">{{ message.text }}</v-alert>
 
-      <v-row>
-        <v-col cols="12" md="4">
-          <v-switch v-model="config.enabled" label="启用插件" hide-details density="compact" />
-        </v-col>
-        <v-col cols="12" md="4">
-          <v-text-field v-model="config.passport" label="123云盘账号（手机号/邮箱）"
-                        density="compact" hide-details />
-        </v-col>
-        <v-col cols="12" md="4">
-          <v-text-field v-model="config.password" label="密码" type="password"
-                        density="compact" hide-details />
-        </v-col>
-      </v-row>
-
-      <v-row class="mt-1">
-        <v-col cols="12" md="4">
-          <v-text-field v-model="config.cron" label="定时同步 cron（留空=仅手动，5位表达式）"
-                        placeholder="0 3 * * *" density="compact" hide-details />
-        </v-col>
-        <v-col cols="12" md="4" d-flex align-center>
-          <v-switch v-model="config.notify" label="同步完成发送通知" hide-details density="compact" />
-        </v-col>
-        <v-col cols="12" md="4" class="d-flex align-center ga-2">
-          <v-btn variant="tonal" color="info" size="small" :loading="testing"
-                 @click="testLogin">
-            验证登录
-          </v-btn>
-        </v-col>
-      </v-row>
-
-      <v-divider class="my-4" />
-
-      <div class="d-flex align-center mb-2">
-        <div class="text-subtitle-2">同步任务对</div>
-        <v-spacer />
-        <v-btn size="small" variant="tonal" color="primary" prepend-icon="mdi-plus"
-               @click="addTask">
-          添加任务对
-        </v-btn>
+      <div class="d-flex align-center flex-wrap ga-2 mb-3">
+        <div class="text-subtitle-1 font-weight-medium">基本设置</div><v-spacer />
+        <v-switch v-model="config.enabled" label="启用插件" color="primary" hide-details density="compact" />
       </div>
+      <v-row dense>
+        <v-col cols="12" sm="6">
+          <v-text-field v-model="config.passport" label="123云盘账号（手机号/邮箱）"
+                        variant="outlined" density="compact" hide-details />
+        </v-col>
+        <v-col cols="12" sm="6">
+          <v-text-field v-model="config.password" label="密码" type="password"
+                        variant="outlined" density="compact" hide-details />
+        </v-col>
+        <v-col cols="12" sm="6">
+          <v-text-field v-model="config.cron" label="定时同步 Cron" placeholder="0 3 * * *"
+                        hint="留空时仅手动同步；填写 5 位表达式" persistent-hint
+                        variant="outlined" density="compact" />
+        </v-col>
+        <v-col cols="12" sm="6" class="d-flex align-center flex-wrap ga-3">
+          <v-switch v-model="config.notify" label="同步完成发送通知" color="primary" hide-details density="compact" />
+          <v-btn variant="tonal" color="primary" size="small" :loading="testing" @click="testLogin">验证登录</v-btn>
+        </v-col>
+      </v-row>
 
-      <v-card v-for="(task, index) in config.tasks" :key="task._key" variant="outlined"
-              class="mb-3" density="compact">
+      <v-divider class="my-5" />
+      <div class="d-flex align-center flex-wrap ga-2 mb-1">
+        <div class="text-subtitle-1 font-weight-medium">同步任务</div><v-spacer />
+        <v-btn size="small" variant="tonal" color="primary" prepend-icon="mdi-plus" @click="addTask">添加任务</v-btn>
+      </div>
+      <div class="text-body-2 text-medium-emphasis mb-4">本地目录使用 MoviePilot 容器内的路径；云盘目标目录不存在时会自动创建。</div>
+
+      <v-card v-for="(task, index) in config.tasks" :key="task._key" variant="outlined" class="mb-3">
         <v-card-text>
+          <div class="d-flex align-center ga-2 mb-3">
+            <span class="text-subtitle-2">任务 {{ index + 1 }}</span><v-spacer />
+            <v-switch v-model="task.enabled" label="启用" color="primary" density="compact" hide-details />
+            <v-btn icon="mdi-delete-outline" variant="text" color="error" size="small"
+                   :aria-label="`删除任务 ${index + 1}`" @click="removeTask(index)" />
+          </div>
           <v-row dense>
-            <v-col cols="12" md="3">
-              <v-text-field v-model="task.name" label="名称" density="compact" hide-details />
+            <v-col cols="12" sm="6">
+              <v-text-field v-model="task.name" label="任务名称（可选）" variant="outlined" density="compact" hide-details />
             </v-col>
-            <v-col cols="12" md="4">
-              <v-text-field v-model="task.source_path" label="源目录（MP容器内本地路径）"
-                            placeholder="/mp/movies" density="compact" hide-details />
+            <v-col cols="12" sm="6">
+              <v-select v-model="task.policy" :items="policyItems" item-title="title" item-value="value"
+                        label="同名策略" variant="outlined" density="compact" hide-details />
             </v-col>
-            <v-col cols="12" md="4">
-              <v-text-field v-model="task.target_path" label="123云盘目标目录"
-                            placeholder="/test/movies" density="compact" hide-details />
+            <v-col cols="12" md="6">
+              <DirectoryPicker v-model="task.source_path" label="本地源目录" placeholder="/mp/movies"
+                               :api="api" :plugin-id="pluginId" />
             </v-col>
-            <v-col cols="12" md="2">
-              <v-select v-model="task.policy" :items="policyItems" item-title="title"
-                        item-value="value" label="同名策略" density="compact" hide-details />
+            <v-col cols="12" md="6">
+              <DirectoryPicker v-model="task.target_path" label="123云盘目标目录" placeholder="/test/movies"
+                               :api="api" :plugin-id="pluginId" remote :passport="config.passport" :password="config.password" />
             </v-col>
-            <v-col cols="12" md="3">
-              <v-text-field v-model="task.exclude_ext" label="排除扩展名（逗号分隔）"
-                            placeholder=".nfo,.txt" density="compact" hide-details />
-            </v-col>
-            <v-col cols="6" md="5" class="d-flex align-center">
-              <v-switch v-model="task.enabled" label="启用" density="compact" hide-details />
-            </v-col>
-            <v-col cols="6" md="2" class="d-flex align-center justify-end">
-              <v-btn icon="mdi-delete-outline" variant="text" color="error" size="small"
-                     @click="removeTask(index)" />
+            <v-col cols="12">
+              <v-text-field v-model="task.exclude_ext" label="排除扩展名（逗号分隔）" placeholder=".nfo,.txt"
+                            variant="outlined" density="compact" hide-details />
             </v-col>
           </v-row>
         </v-card-text>
       </v-card>
-      <div v-if="!config.tasks.length" class="text-body-2 text-medium-emphasis mb-3">
-        还没有任务对。源目录是 MP 容器内可见的本地路径；目标目录是 123 云盘内的路径（不存在会自动创建）。
-      </div>
-
-      <v-divider class="my-4" />
-
-      <div class="d-flex ga-2">
-        <v-btn color="primary" variant="flat" :loading="saving" @click="save">
-          保存
-        </v-btn>
-        <v-btn variant="tonal" :loading="loading" @click="load">
-          重新加载
-        </v-btn>
+      <v-alert v-if="!config.tasks.length" type="info" variant="tonal" density="compact">还没有任务，点击“添加任务”开始配置。</v-alert>
+      <v-divider class="my-5" />
+      <div class="d-flex flex-wrap ga-2">
+        <v-btn color="primary" variant="flat" :loading="saving" @click="save">保存</v-btn>
+        <v-btn variant="tonal" :loading="loading" @click="load">重新加载</v-btn>
       </div>
     </v-card-text>
   </v-card>
@@ -99,6 +77,7 @@
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
+import DirectoryPicker from './DirectoryPicker.vue'
 
 const props = defineProps({
   api: { type: Object, required: true },
@@ -184,8 +163,8 @@ async function save() {
     if (result?.success === false) {
       message.value = { type: 'error', text: result?.message || '保存失败' }
     } else {
-      message.value = { type: 'success', text: '已保存' }
       await load()
+      message.value = { type: 'success', text: '已保存' }
     }
   } catch (e) {
     message.value = { type: 'error', text: `保存失败：${e}` }
@@ -195,12 +174,10 @@ async function save() {
 }
 
 async function testLogin() {
-  // 保存一次再验证，确保后端用的是当前输入的账号
   testing.value = true
   message.value = null
   try {
-    await props.api.post(`plugin/${props.pluginId}/save_config`, { config: buildPayload() })
-    const result = await props.api.post(`plugin/${props.pluginId}/test_login`)
+    const result = await props.api.post(`plugin/${props.pluginId}/test_login`, { passport: config.passport, password: config.password })
     message.value = {
       type: result?.success ? 'success' : 'error',
       text: result?.message || (result?.success ? '登录成功' : '登录失败'),
