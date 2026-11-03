@@ -198,6 +198,28 @@ def unique_keep_both_name(name: str, taken: Callable[[str], bool]) -> str:
             return candidate
 
 
+def plan_duplicate_action(local: LocalFile, remote: Dict, policy: str) -> SyncAction:
+    """Plan one local file whose remote path holds several same-name copies.
+
+    The engine never renames or deletes among duplicates: when the local file
+    matches at least one copy by size+md5 the content is already in the cloud
+    and the path is skipped (except for overwrite, which would leave a stray
+    copy behind); otherwise the file fails on its own with guidance to clean
+    the cloud directory.
+    """
+    local_md5 = (local.md5 or "").lower()
+    matched = any(local_md5 and c.get("md5") and str(c["md5"]).lower() == local_md5
+                  and int(c.get("size") or 0) == local.size
+                  for c in remote.get("candidates") or [])
+    if matched and policy != POLICY_OVERWRITE:
+        return SyncAction(kind="skip", local=local)
+    if matched:
+        error = "云盘存在多个同名文件，无法唯一确定覆盖目标；请到云盘删除多余副本后重试"
+    else:
+        error = "云盘存在多个同名文件且无法确认与本地一致；请到云盘删除或改名多余副本后重试"
+    return SyncAction(kind="conflict", local=local, error=error)
+
+
 def plan_sync(
     local_files: List[LocalFile],
     remote_map: Dict[str, Dict],
@@ -206,12 +228,17 @@ def plan_sync(
     """Build the action list for one pair.
 
     ``remote_map`` maps relative posix path -> ``{"fileid": int, "size": int}``.
+    Paths with several same-name remote copies carry ``{"ambiguous": True,
+    "candidates": [...]}`` and are resolved by :func:`plan_duplicate_action`.
     """
     actions: List[SyncAction] = []
     for local in local_files:
         remote = remote_map.get(local.rel_path)
         if remote is None:
             actions.append(SyncAction(kind="upload", local=local))
+            continue
+        if remote.get("ambiguous"):
+            actions.append(plan_duplicate_action(local, remote, policy))
             continue
         same_size = int(remote.get("size") or 0) == local.size
         remote_args = {
@@ -619,19 +646,34 @@ class SyncEngine:
 
     def run(self, pairs: List[TaskPairConfig], retry_paths: Optional[Dict[str, set]] = None,
             already_started: bool = False, selected_paths: Optional[Dict[str, Dict[str, Dict]]] = None) -> Dict:
-        """Blocking run over all pairs. Returns the run summary."""
+        """Blocking run over all pairs. Returns the run summary.
+
+        A pair that fails outside the per-file loop (source scan, remote
+        listing) is reported and skipped; the remaining pairs still run.
+        """
         if not already_started:
             self.state.begin(pairs)
         self.log(f"同步开始 run={self.state.run_id}，共 {len(pairs)} 个任务对")
+        failed_pairs: List[str] = []
         try:
             for pair in pairs:
                 if self.cancel_event.is_set():
                     break
-                self._run_pair(pair, None if retry_paths is None else retry_paths[pair.id],
-                               None if selected_paths is None else selected_paths[pair.id])
+                try:
+                    self._run_pair(pair, None if retry_paths is None else retry_paths[pair.id],
+                                   None if selected_paths is None else selected_paths[pair.id])
+                except KeyboardInterrupt:
+                    raise
+                except Exception as err:  # noqa: BLE001 - keep other pairs running
+                    failed_pairs.append(f"{pair.name}: {err}")
+                    self.state.pair_update(pair.id, phase=PHASE_ERROR, current=str(err))
+                    self.log(f"[{pair.name}] 任务对失败: {err}")
             if self.cancel_event.is_set():
                 self.state.finish(PHASE_CANCELLED)
                 self.log("同步已取消")
+            elif failed_pairs:
+                self.state.finish(PHASE_ERROR, "；".join(failed_pairs))
+                self.log("同步失败")
             else:
                 self.state.finish(PHASE_FINISHED)
                 self.log("同步完成")
@@ -694,13 +736,20 @@ class SyncEngine:
                 if self._cancelled():
                     raise KeyboardInterrupt
             normalized = normalize_rel_path(rel_path)
-            if normalized in remote_map:
-                raise RuntimeError(f"云盘存在多个同名文件，无法安全比对: {normalized}")
-            remote_map[normalized] = {
-                "fileid": item.file_id,
-                "size": item.size,
-                "md5": getattr(item, "md5", None),
-            }
+            entry = {"fileid": item.file_id, "size": item.size,
+                     "md5": getattr(item, "md5", None)}
+            existing = remote_map.get(normalized)
+            if existing is None:
+                remote_map[normalized] = entry
+            else:
+                # 123云盘允许同名文件共存（API 上传、回收站恢复等）。不再让整个
+                # 运行失败：记录全部候选，交给 plan_sync 按内容消歧或单文件报错。
+                candidates = existing.get("candidates")
+                if candidates is None:
+                    candidates = [{key: existing[key] for key in ("fileid", "size", "md5")}]
+                    self.log(f"远端存在同名重复文件: {normalized}")
+                candidates.append(entry)
+                remote_map[normalized] = {"ambiguous": True, "candidates": candidates}
         return remote_map
 
     # ----------------------------------------------------------------- pair
@@ -771,6 +820,15 @@ class SyncEngine:
 
         for local in local_files:
             remote = remote_map.get(local.rel_path)
+            if remote is not None and remote.get("ambiguous"):
+                # Hash once so plan_duplicate_action can match against every
+                # same-name copy; sizes that already differ cannot match.
+                candidates = remote.get("candidates") or []
+                if any(int(c.get("size") or 0) == local.size and c.get("md5")
+                       for c in candidates):
+                    self.state.pair_update(pair.id, current=f"校验 {local.rel_path}")
+                    self._hash_source(local)
+                continue
             if (pair.policy != POLICY_OVERWRITE and remote and remote.get("size") == local.size
                     and remote.get("md5")):
                 self.state.pair_update(pair.id, current=f"校验 {local.rel_path}")
@@ -820,7 +878,7 @@ class SyncEngine:
                     self.state.mark_file(key, FILE_SKIPPED, percent=100.0)
                     self.state.add_skipped_bytes(action.local.size)
                     self.state.pair_update(pair.id, skipped=skipped)
-                elif action.kind == "unverified":
+                elif action.kind in ("unverified", "conflict"):
                     raise RuntimeError(action.error)
                 else:
                     self._execute_action(pair, action, key, remote_map)

@@ -95,7 +95,7 @@ class P123Sync(_PluginBase):
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录同步到123云盘：支持手动、目录监控及下载器监控，内容校验、安全覆盖与中断恢复。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -133,6 +133,7 @@ class P123Sync(_PluginBase):
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_lock = threading.Lock()
         self._monitor_status: Dict[str, Dict[str, Any]] = {}
+        self._last_fail_notify: Optional[tuple] = None
         self._download_chain = None
 
     # ------------------------------------------------------------ lifecycle
@@ -464,7 +465,7 @@ class P123Sync(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
         """Vue federated frontend with a versioned asset directory."""
-        return "vue", "dist/v1_5_0"
+        return "vue", "dist/v1_6_0"
 
     def get_dashboard(self, key: str = "", user_agent: str = None) -> Tuple[dict, dict, None]:
         """Register the federated Dashboard with the MoviePilot host."""
@@ -972,7 +973,11 @@ class P123Sync(_PluginBase):
             scope = scope_for(pair, passport)
             try:
                 counts = journal.monitor_counts(pair.id, scope)
-                status.setdefault(pair.id, {'mode':pair.trigger_mode, 'state':'error', 'message':'监控暂不可用'}).update(counts)
+                entry = status.setdefault(pair.id, {'mode':pair.trigger_mode, 'state':'error', 'message':'监控暂不可用'})
+                entry.update(counts)
+                if counts.get('gave_up'):
+                    entry['message'] = (f"{counts['gave_up']} 个文件多次同步失败，已暂停自动重试；"
+                                        '文件内容变化后自动恢复，也可手动同步或重试失败项')
                 active = observed.get(pair.id, {})
                 candidates = journal.monitor_ready(pair.id, scope, current_time(), pair.settle_seconds, MONITOR_BATCH_SIZE)
                 matching = {item['path']:item for item in candidates if active.get(item['path']) == item}
@@ -1194,7 +1199,7 @@ class P123Sync(_PluginBase):
     def _notify_result(self, state: RunState):
         if not self._notify:
             return
-        snapshot = state.snapshot(include_files=False)
+        snapshot = state.snapshot()
         counters = snapshot["counters"]
         phase = snapshot["phase"]
         titles = {
@@ -1207,6 +1212,19 @@ class P123Sync(_PluginBase):
             title = "123云盘同步完成（有失败）"
         if not title:
             return
+        # 自动触发（监控/定时/重试）的运行在失败集合与错误文本都未变化时不再
+        # 重复推送，避免永久性失败（如云盘同名冲突）每小时刷屏；手动运行始终
+        # 推送。一次干净的成功会清空记忆，之后的同类失败会重新提醒。
+        if snapshot.get("trigger") in ("monitor", "retry", "schedule") and (
+                phase == PHASE_ERROR or counters.get("failed")):
+            signature = (phase, tuple(sorted(
+                (record.get("path") or "", record.get("error") or "")
+                for record in snapshot["files"] if record.get("state") == "failed")))
+            if signature == self._last_fail_notify:
+                return
+            self._last_fail_notify = signature
+        elif phase == PHASE_FINISHED and not counters.get("failed"):
+            self._last_fail_notify = None
         text = (
             f"上传 {counters.get('done', 0)}，秒传 {counters.get('instant', 0)}，"
             f"跳过 {counters.get('skipped', 0)}，失败 {counters.get('failed', 0)}"

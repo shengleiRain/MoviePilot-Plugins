@@ -1005,3 +1005,137 @@ def test_incorrect_staged_hash_never_moves_or_trashes_old_file(local_tree):
     assert state.snapshot()['counters']['failed'] == 1
     assert not client.renames and not client.trashed
     assert any(item.file_id == 503 and item.name == 'a.txt' for item in client.remote['2'])
+
+
+# ------------------------------------------------------- duplicate remote names
+
+def test_plan_sync_resolves_ambiguous_duplicate_by_md5():
+    local = engine_mod.LocalFile('books/x.pdf', Path('x'), 5,
+                                 md5=hashlib.md5(b'aaa').hexdigest())
+    remote = {'books/x.pdf': {'ambiguous': True, 'candidates': [
+        {'fileid': 1, 'size': 5, 'md5': hashlib.md5(b'aaa').hexdigest()},
+        {'fileid': 2, 'size': 5, 'md5': hashlib.md5(b'aaa').hexdigest()}]}}
+    assert engine_mod.plan_sync([local], remote,
+                                engine_mod.POLICY_SKIP_SAME_SIZE)[0].kind == 'skip'
+    assert engine_mod.plan_sync([local], remote,
+                                engine_mod.POLICY_KEEP_BOTH)[0].kind == 'skip'
+    action = engine_mod.plan_sync([local], remote, engine_mod.POLICY_OVERWRITE)[0]
+    assert action.kind == 'conflict' and '覆盖' in action.error
+
+
+def test_plan_sync_conflicts_when_duplicate_differs_from_local():
+    local = engine_mod.LocalFile('books/x.pdf', Path('x'), 5,
+                                 md5=hashlib.md5(b'local').hexdigest())
+    remote = {'books/x.pdf': {'ambiguous': True, 'candidates': [
+        {'fileid': 1, 'size': 5, 'md5': hashlib.md5(b'other1').hexdigest()},
+        {'fileid': 2, 'size': 7, 'md5': hashlib.md5(b'other2').hexdigest()}]}}
+    for policy in engine_mod.POLICIES:
+        action = engine_mod.plan_sync([local], remote, policy)[0]
+        assert action.kind == 'conflict'
+        assert '同名' in action.error and '云盘' in action.error
+
+
+def test_plan_sync_conflicts_when_duplicate_lacks_digest():
+    local = engine_mod.LocalFile('books/x.pdf', Path('x'), 5, md5=None)
+    remote = {'books/x.pdf': {'ambiguous': True,
+                              'candidates': [{'fileid': 1, 'size': 5, 'md5': None}]}}
+    action = engine_mod.plan_sync([local], remote,
+                                  engine_mod.POLICY_SKIP_SAME_SIZE)[0]
+    assert action.kind == 'conflict'
+
+
+def test_build_remote_map_collects_duplicate_names(local_tree):
+    client = FakeClient(remote={
+        '0': [FakeItem(1, 'test', 1)],
+        '1': [FakeItem(2, 'target', 1)],
+        '2': [FakeItem(503, 'a.txt', 0, 3, hashlib.md5(b'aaa').hexdigest()),
+              FakeItem(504, 'a.txt', 0, 3, hashlib.md5(b'aaa').hexdigest()),
+              FakeItem(500, 'Season 1', 1)],
+        '500': [FakeItem(501, 'e01.mkv', 0, 100, hashlib.md5(b'x' * 100).hexdigest())],
+    })
+    pair = make_pair(local_tree.parent)
+    state = engine_mod.RunState()
+    eng = engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state)
+    remote_map = eng._build_remote_map(pair)
+    entry = remote_map['a.txt']
+    assert entry.get('ambiguous') is True and len(entry['candidates']) == 2
+    assert remote_map['Season 1/e01.mkv'].get('ambiguous') is None
+
+
+def test_engine_duplicate_identical_copy_skips_and_rest_still_syncs(local_tree):
+    client = FakeClient(remote={
+        '0': [FakeItem(1, 'test', 1)],
+        '1': [FakeItem(2, 'target', 1)],
+        '2': [FakeItem(503, 'a.txt', 0, 3, hashlib.md5(b'aaa').hexdigest()),
+              FakeItem(504, 'a.txt', 0, 3, hashlib.md5(b'aaa').hexdigest()),
+              FakeItem(500, 'Season 1', 1)],
+        '500': [FakeItem(501, 'e01.mkv', 0, 100, hashlib.md5(b'x' * 100).hexdigest()),
+                FakeItem(502, 'e02.mkv', 0, 200, hashlib.md5(b'y' * 200).hexdigest())],
+    })
+    pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
+    state, summary = run_engine(client, [pair])
+    snap = state.snapshot()
+    assert summary['phase'] == engine_mod.PHASE_FINISHED
+    assert snap['counters']['skipped'] == 3      # duplicated a.txt + e01 + e02
+    assert snap['counters']['done'] == 0 and snap['counters']['failed'] == 0
+    assert client.uploads == [] and not client.trashed
+
+
+def test_engine_duplicate_conflict_fails_only_that_file(local_tree):
+    client = FakeClient(remote={
+        '0': [FakeItem(1, 'test', 1)],
+        '1': [FakeItem(2, 'target', 1)],
+        '2': [FakeItem(503, 'a.txt', 0, 3, hashlib.md5(b'old-one').hexdigest()),
+              FakeItem(504, 'a.txt', 0, 4, hashlib.md5(b'old-two').hexdigest()),
+              FakeItem(500, 'Season 1', 1)],
+        '500': [FakeItem(501, 'e01.mkv', 0, 100, hashlib.md5(b'x' * 100).hexdigest()),
+                FakeItem(502, 'e02.mkv', 0, 200, hashlib.md5(b'y' * 200).hexdigest())],
+    })
+    pair = make_pair(local_tree.parent, exclude_ext=['.nfo'])
+    state, summary = run_engine(client, [pair])
+    snap = state.snapshot()
+    assert summary['phase'] == engine_mod.PHASE_FINISHED
+    assert snap['counters']['failed'] == 1 and snap['counters']['skipped'] == 2
+    failed = next(f for f in snap['files'] if f['state'] == 'failed')
+    assert failed['path'] == 'a.txt' and '同名' in failed['error']
+    assert not client.uploads and not client.trashed
+
+
+def test_engine_pair_listing_failure_does_not_block_other_pairs(local_tree, tmp_path):
+    missing = make_pair(tmp_path, id='bad', name='坏任务对',
+                        source_path=str(tmp_path / 'missing'))
+    good = make_pair(local_tree.parent, id='good', name='好任务对', exclude_ext=['.nfo'])
+    client = FakeClient(remote={'0': [FakeItem(1, 'test', 1)]})
+    state, summary = run_engine(client, [missing, good])
+    snap = state.snapshot()
+    assert snap['pairs']['bad']['phase'] == engine_mod.PHASE_ERROR
+    assert snap['pairs']['good']['phase'] == engine_mod.PHASE_FINISHED
+    assert snap['counters']['done'] == 3
+    assert summary['phase'] == engine_mod.PHASE_ERROR
+    assert '坏任务对' in (summary['error'] or '')
+
+
+def test_monitor_fail_gives_up_after_identical_failures(tmp_path):
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location('p123sync_giveup_test', _PLUGIN_DIR / 'sync_journal.py')
+    module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
+    journal = module.SyncJournal(tmp_path / 'giveup.sqlite3')
+    file = {'path': 'a.pdf', 'size': 3, 'mtime_ns': 1}
+    journal.observe_files('p', 'scope', [file], now=1000, complete=True)
+    # four identical failures keep the normal 60s->8min backoff
+    for offset in (2000, 2100, 2200, 2300):
+        journal.monitor_fail('p', 'scope', 'a.pdf', 3, 1, '同名冲突', now=offset)
+    assert journal.monitor_counts('p', 'scope')['gave_up'] == 0
+    assert journal.monitor_ready('p', 'scope', 3000, 120) == [file]  # backoff expires
+    # the fifth identical failure pauses auto-retry instead of delaying again
+    journal.monitor_fail('p', 'scope', 'a.pdf', 3, 1, '同名冲突', now=3000)
+    assert journal.monitor_counts('p', 'scope')['gave_up'] == 1
+    assert journal.monitor_ready('p', 'scope', 3000 + 10 ** 6, 120) == []
+    # a different error restarts the escalation instead of staying paused
+    journal.monitor_fail('p', 'scope', 'a.pdf', 3, 1, '网络错误', now=3100)
+    assert journal.monitor_counts('p', 'scope')['gave_up'] == 0
+    assert journal.monitor_ready('p', 'scope', 3300, 120) == [file]
+    # a changed file clears the pause via observe_files
+    journal.observe_files('p', 'scope', [{'path': 'a.pdf', 'size': 9, 'mtime_ns': 2}], now=3400, complete=True)
+    assert journal.monitor_counts('p', 'scope')['gave_up'] == 0
+    journal.close()

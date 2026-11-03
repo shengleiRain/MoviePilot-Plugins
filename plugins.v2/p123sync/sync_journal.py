@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
+# Consecutive identical failures before a monitored file stops auto-retrying.
+MONITOR_GIVE_UP_FAILURES = 5
+
 
 class SyncJournal:
     def __init__(self, path: Path):
@@ -120,22 +123,42 @@ class SyncJournal:
             return [{'path': row[0], 'size': row[1], 'mtime_ns': row[2]} for row in rows]
 
     def monitor_fail(self, pair_id: str, scope: str, path: str, size: int, mtime_ns: int, error: str, now: float):
+        """Back off a failing file; pause auto-retry after repeated identical failures.
+
+        The counter restarts when the error text changes (a new, possibly
+        transient problem), and any size/mtime change in ``observe_files``
+        clears it. Five identical failures in a row mean the file cannot be
+        synced as-is, so auto-retry pauses until the file or the cloud
+        changes; manual runs are never gated by ``retry_after``.
+        """
         with self._lock, self._conn:
-            row = self._conn.execute('SELECT failures FROM monitor_files WHERE pair_id=? AND scope=? AND path=? AND size=? AND mtime_ns=?',
+            row = self._conn.execute('SELECT failures, last_error FROM monitor_files WHERE pair_id=? AND scope=? AND path=? AND size=? AND mtime_ns=?',
                                      (pair_id, scope, path, size, mtime_ns)).fetchone()
             if row:
-                failures = min(row[0] + 1, 10)
-                delay = min(60 * 2 ** (failures - 1), 3600)
+                message = str(error)[:500]
+                if row[1] is not None and row[1] != message:
+                    failures = 1
+                else:
+                    failures = min(row[0] + 1, 10)
+                if failures >= MONITOR_GIVE_UP_FAILURES:
+                    retry_after = now + 10 ** 9
+                    message = f"{message}；已暂停自动重试，文件内容变化后自动恢复，也可手动同步"
+                else:
+                    retry_after = now + min(60 * 2 ** (failures - 1), 3600)
                 self._conn.execute('UPDATE monitor_files SET failures=?, retry_after=?, last_error=? WHERE pair_id=? AND scope=? AND path=?',
-                                   (failures, now + delay, str(error)[:500], pair_id, scope, path))
+                                   (failures, retry_after, message, pair_id, scope, path))
 
     def monitor_counts(self, pair_id: str, scope: str) -> Dict:
         with self._lock:
             row = self._conn.execute('''SELECT COUNT(*), SUM(CASE WHEN present=1 AND
                 (synced_size IS NULL OR synced_size!=size OR synced_mtime_ns!=mtime_ns) THEN 1 ELSE 0 END),
-                SUM(CASE WHEN present=0 AND (synced_size IS NULL OR synced_size!=size OR synced_mtime_ns!=mtime_ns) THEN 1 ELSE 0 END)
-                FROM monitor_files WHERE pair_id=? AND scope=?''', (pair_id, scope)).fetchone()
-            return {'observed': row[0] or 0, 'pending': row[1] or 0, 'missing': row[2] or 0}
+                SUM(CASE WHEN present=0 AND (synced_size IS NULL OR synced_size!=size OR synced_mtime_ns!=mtime_ns) THEN 1 ELSE 0 END),
+                SUM(CASE WHEN present=1 AND failures>=? AND
+                (synced_size IS NULL OR synced_size!=size OR synced_mtime_ns!=mtime_ns) THEN 1 ELSE 0 END)
+                FROM monitor_files WHERE pair_id=? AND scope=?''',
+                (MONITOR_GIVE_UP_FAILURES, pair_id, scope)).fetchone()
+            return {'observed': row[0] or 0, 'pending': row[1] or 0, 'missing': row[2] or 0,
+                    'gave_up': row[3] or 0}
 
     def load_latest(self) -> Optional[Dict]:
         with self._lock:
