@@ -81,8 +81,8 @@ def test_root_source_is_preserved(plugin_module):
 
 def test_versioned_frontend_and_dashboard_registration(plugin_module):
     plugin = plugin_module.P123Sync()
-    assert plugin.plugin_version == '1.2.0'
-    assert plugin.get_render_mode() == ('vue', 'dist/v1_2_0')
+    assert plugin.plugin_version == '1.3.0'
+    assert plugin.get_render_mode() == ('vue', 'dist/v1_3_0')
     assert plugin.get_dashboard() == ({'cols': 12, 'md': 6}, {'border': False}, None)
 
 
