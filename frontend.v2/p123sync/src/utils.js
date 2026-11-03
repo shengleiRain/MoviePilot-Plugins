@@ -1,5 +1,6 @@
 export function fmtBytes(value) {
   const n = Number(value) || 0
+  if (n >= 1024 ** 4) return `${(n / 1024 ** 4).toFixed(2)} TB`
   if (n < 1024) return `${n} B`
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`
@@ -67,7 +68,7 @@ export const FILE_STATE_COLOR = {
 }
 
 export const POLICY_TEXT = {
-  skip_same_size: '相同大小跳过',
+  skip_same_size: '内容一致时跳过',
   overwrite: '覆盖（旧文件进回收站）',
   keep_both: '保留两者（自动改名）',
 }

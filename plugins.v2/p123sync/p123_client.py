@@ -15,6 +15,7 @@ failures so the sync engine never has to touch raw API responses.
 from __future__ import annotations
 
 import time
+import re
 from hashlib import md5
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -59,6 +60,11 @@ class RemoteItem(dict):
     def size(self) -> int:
         return int(self.get("Size") or 0)
 
+    @property
+    def md5(self) -> Optional[str]:
+        value = str(self.get("Etag") or self.get("etag") or "").strip().lower()
+        return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
+
 
 class P123AutoClient:
     """Lazy proxy over :class:`p123client.P123Client` with token re-login.
@@ -89,23 +95,23 @@ class P123AutoClient:
 
     def call(self, name: str, *args, **kwargs) -> Any:
         """Invoke a P123Client method with one token-limit re-login retry."""
-        if self._client is None:
-            self._client = self._build()
         try:
+            if self._client is None:
+                self._client = self._build()
             result = getattr(self._client, name)(*args, **kwargs)
         except Exception as err:
-            raise P123ClientError(f"{name} 调用失败: {err}") from err
+            raise P123ClientError(f"{name} 调用失败（{type(err).__name__}）") from err
         if (
             isinstance(result, dict)
             and result.get("code") == 401
             and result.get("message") == "tokens number has exceeded the limit"
         ):
             self.close()
-            self._client = self._build()
             try:
+                self._client = self._build()
                 result = getattr(self._client, name)(*args, **kwargs)
             except Exception as err:
-                raise P123ClientError(f"{name} 重连后调用失败: {err}") from err
+                raise P123ClientError(f"{name} 重连后调用失败（{type(err).__name__}）") from err
         return result
 
 
@@ -129,18 +135,27 @@ class P123SyncClient:
         self._logger(message)
 
     def _checked(self, name: str, *args, **kwargs) -> Dict:
-        resp = self.client.call(name, *args, **kwargs)
+        try:
+            resp = self.client.call(name, *args, **kwargs)
+        except P123ClientError:
+            raise
+        except Exception as err:
+            raise P123ClientError(f"{name} 调用失败（{type(err).__name__}）") from err
         try:
             check_response(resp)
         except Exception as err:
-            raise P123ClientError(f"{name} 响应异常: {err}") from err
+            raise P123ClientError(f"{name} 响应异常（{type(err).__name__}）") from err
         return resp
 
     def user_info(self) -> Dict[str, Any]:
         resp = self._checked("user_info")
         data = resp.get("data") or {}
-        total = int(data.get("SpacePermanent") or 0)
-        used = int(data.get("SpaceUsed") or 0)
+        if data.get("SpacePermanent") is None or data.get("SpaceUsed") is None:
+            raise P123ClientError("云盘未返回完整的空间用量信息")
+        total = int(data["SpacePermanent"]) + int(data.get("SpaceTemp") or 0)
+        used = int(data["SpaceUsed"])
+        if total < 0 or used < 0:
+            raise P123ClientError("云盘返回的空间用量无效")
         return {"total": total, "used": used, "available": total - used}
 
     def login_ok(self) -> Tuple[bool, str]:
@@ -148,16 +163,19 @@ class P123SyncClient:
             info = self.user_info()
         except Exception as err:
             return False, str(err)
-        return True, f"剩余空间 {max(info['available'], 0) / 1024 ** 3:.1f} GB"
+        return True, "登录成功"
 
     # ----------------------------------------------------------------- listing
 
-    def list_dir(self, parent_file_id: int) -> List[RemoteItem]:
+    def list_dir(self, parent_file_id: int, cancel_check: Optional[Callable[[], bool]] = None) -> List[RemoteItem]:
         """List one directory (files + subdirs), following Next pagination."""
         items: List[RemoteItem] = []
         page = 1
         next_flag = 0
+        seen_next = set()
         while True:
+            if cancel_check and cancel_check():
+                raise KeyboardInterrupt
             payload = {
                 "limit": PAGE_SIZE,
                 "next": next_flag,
@@ -166,24 +184,32 @@ class P123SyncClient:
                 "inDirectSpace": "false",
             }
             resp = self._checked("fs_list", payload)
-            data = resp.get("data") or {}
+            data = resp.get("data")
+            if not isinstance(data, dict) or "InfoList" not in data or "Next" not in data:
+                raise P123ClientError("云盘目录响应缺少列表或分页信息，无法确认列举完整")
             info_list = data.get("InfoList") or []
-            if not info_list:
-                break
+            if not isinstance(info_list, list):
+                raise P123ClientError("云盘目录响应格式异常，无法确认列举完整")
             items.extend(RemoteItem(item) for item in info_list if item)
             if str(data.get("Next")) == "-1":
                 break
+            if not info_list or data.get("Next") is None or str(data.get("Next")) in seen_next:
+                raise P123ClientError("云盘目录分页中断或重复，无法确认列举完整")
             page += 1
             next_flag = data.get("Next")
-            time.sleep(self._page_interval)
+            seen_next.add(str(next_flag))
+            self._wait(self._page_interval, cancel_check)
         return items
 
-    def walk(self, root_file_id: int, prefix: str = "") -> Iterator[Tuple[str, RemoteItem]]:
+    def walk(self, root_file_id: int, prefix: str = "",
+             cancel_check: Optional[Callable[[], bool]] = None) -> Iterator[Tuple[str, RemoteItem]]:
         """Yield (relative_path, item) for every file under root, depth-first."""
         stack: List[Tuple[str, int]] = [(prefix, int(root_file_id))]
         while stack:
+            if cancel_check and cancel_check():
+                raise KeyboardInterrupt
             rel_dir, dir_id = stack.pop()
-            for item in self.list_dir(dir_id):
+            for item in self.list_dir(dir_id, cancel_check=cancel_check):
                 rel_path = f"{rel_dir}{item.name}"
                 if item.is_dir:
                     stack.append((f"{rel_path}/", item.file_id))
@@ -204,6 +230,10 @@ class P123SyncClient:
         self._checked("fs_trash", int(file_id), event="intoRecycle")
         return True
 
+    def rename(self, file_id: int, name: str) -> None:
+        # Never ask the remote service to replace a same-name file implicitly.
+        self._checked("fs_rename", {"FileId": int(file_id), "fileName": name, "duplicate": 0})
+
     def file_exists(self, file_id: int) -> bool:
         try:
             self._checked("fs_info", int(file_id))
@@ -211,15 +241,17 @@ class P123SyncClient:
         except P123ClientError:
             return False
 
-    def _file_md5(self, path: Path) -> str:
+    def _file_md5(self, path: Path, cancel_check: Optional[Callable[[], bool]] = None) -> str:
         hasher = md5()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(MD5_CHUNK_SIZE), b""):
+                if cancel_check and cancel_check():
+                    raise KeyboardInterrupt
                 hasher.update(chunk)
         return hasher.hexdigest()
 
     def _put(self, url: str, data: bytes) -> None:
-        self.client.call(
+        response = self.client.call(
             "request",
             url,
             method="PUT",
@@ -228,6 +260,8 @@ class P123SyncClient:
             timeout=UPLOAD_TIMEOUT_SECONDS,
             data=data,
         )
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
 
     def upload(
         self,
@@ -236,11 +270,14 @@ class P123SyncClient:
         name: str,
         on_progress: Optional[Callable[[float], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        file_md5: Optional[str] = None,
     ) -> Tuple[int, bool]:
         """Upload one file. Returns (remote_file_id, instant_upload)."""
         file_size = local_path.stat().st_size
         self._log(f"计算 MD5: {name} ({file_size / 1024 ** 2:.1f} MB)")
-        file_md5 = self._file_md5(local_path)
+        file_md5 = file_md5 or self._file_md5(local_path, cancel_check)
+        if cancel_check and cancel_check():
+            raise KeyboardInterrupt
 
         # 1) instant upload attempt
         resp = self._checked(
@@ -251,14 +288,12 @@ class P123SyncClient:
                 "size": file_size,
                 "parentFileId": int(parent_file_id),
                 "type": 0,
-                "duplicate": 2,
+                "duplicate": 0,
             },
         )
         data = resp.get("data") or {}
         if data.get("Reuse"):
             info = data.get("Info") or {}
-            if on_progress:
-                on_progress(100.0)
             return int(info["FileId"]), True
 
         # 2) slice upload
@@ -280,19 +315,23 @@ class P123SyncClient:
                     upload_data["partNumberStart"] = slice_no
                     upload_data["partNumberEnd"] = slice_no + 1
                     url_resp = self._checked("upload_prepare", upload_data)
-                    self._put_with_retry(url_resp, upload_data, str(slice_no), chunk)
+                    self._put_with_retry(url_resp, upload_data, str(slice_no), chunk, cancel_check)
                     slice_no += 1
                     offset += num_to_upload
                     if on_progress:
                         on_progress(min(offset * 100.0 / file_size, 100.0))
         else:
+            if cancel_check and cancel_check():
+                raise KeyboardInterrupt
             self._log(f"直传: {name}")
             auth_resp = self._checked("upload_auth", upload_data)
-            self._put_with_retry(auth_resp, upload_data, "1", local_path.read_bytes())
+            self._put_with_retry(auth_resp, upload_data, "1", local_path.read_bytes(), cancel_check)
             if on_progress:
                 on_progress(100.0)
 
         upload_data["isMultipart"] = file_size > slice_size
+        if cancel_check and cancel_check():
+            raise KeyboardInterrupt
         complete = self._checked("upload_complete", upload_data)
         info = ((complete.get("data") or {}).get("file_info")) or {}
         if not info.get("FileId"):
@@ -305,11 +344,14 @@ class P123SyncClient:
         upload_data: Dict[str, Any],
         part_key: str,
         chunk: bytes,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         """PUT one slice, retrying with a fresh presigned URL on failures."""
         current = url_resp
         last_error: Optional[Exception] = None
         for attempt in range(1, UPLOAD_RETRIES + 1):
+            if cancel_check and cancel_check():
+                raise KeyboardInterrupt
             part_url = (current.get("data") or {}).get("presignedUrls", {}).get(part_key)
             if part_url:
                 try:
@@ -317,12 +359,20 @@ class P123SyncClient:
                     return
                 except Exception as err:  # noqa: PERF203 - retry loop
                     last_error = err
-                    self._log(f"分片 {part_key} 上传失败 ({attempt}/{UPLOAD_RETRIES}): {err}")
+                    self._log(f"分片 {part_key} 上传失败 ({attempt}/{UPLOAD_RETRIES}): {type(err).__name__}")
             if attempt < UPLOAD_RETRIES:
-                time.sleep(UPLOAD_RETRY_WAIT_SECONDS)
+                self._wait(UPLOAD_RETRY_WAIT_SECONDS, cancel_check)
                 try:
                     current = self._checked("upload_prepare", upload_data)
                 except P123ClientError as err:
                     last_error = err
-                    self._log(f"重新获取上传 URL 失败: {err}")
-        raise P123ClientError(f"分片 {part_key} 上传失败（已重试 {UPLOAD_RETRIES} 次）: {last_error}")
+                    self._log(f"重新获取上传 URL 失败: {type(err).__name__}")
+        raise P123ClientError(f"分片 {part_key} 上传失败（已重试 {UPLOAD_RETRIES} 次，{type(last_error).__name__ if last_error else '无可用地址'}）")
+
+    @staticmethod
+    def _wait(seconds: float, cancel_check: Optional[Callable[[], bool]] = None):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if cancel_check and cancel_check():
+                raise KeyboardInterrupt
+            time.sleep(min(0.2, max(deadline - time.monotonic(), 0)))

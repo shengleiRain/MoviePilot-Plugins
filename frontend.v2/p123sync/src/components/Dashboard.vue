@@ -26,7 +26,7 @@ const phaseText = computed(() => phase.value === 'finished' && status.value?.cou
   ? '已完成（有失败）' : (PHASE_TEXT[phase.value] || phase.value || ''))
 const phaseColor = computed(() => phase.value === 'finished' && status.value?.counters?.failed
   ? 'warning' : (PHASE_COLOR[phase.value] || 'grey'))
-const doneBytes = computed(() => (status.value?.bytes_done || 0) + (status.value?.bytes_skipped || 0))
+const doneBytes = computed(() => (status.value?.bytes_done || 0) + (status.value?.bytes_skipped || 0) + (status.value?.bytes_inflight || 0))
 const totalBytes = computed(() => status.value?.counters?.total_bytes || 0)
 const overallPercent = computed(() => totalBytes.value ? Math.min(doneBytes.value / totalBytes.value * 100, 100) : 0)
 const metrics = [{key:'done',label:'已上传'}, {key:'instant',label:'秒传'}, {key:'skipped',label:'跳过'}, {key:'failed',label:'失败'}]

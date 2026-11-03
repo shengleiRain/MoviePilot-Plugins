@@ -87,3 +87,24 @@ it('paginates failures from the API and retries only the selected record', async
   expect(api.post).toHaveBeenCalledWith('plugin/P123Sync/retry', { run_id:'run-1', file_keys:['p1:file-20.mkv'] })
   wrapper.unmount()
 })
+
+it('opens durable historical file details without treating them as current retries', async () => {
+  const api={get:vi.fn(async path=>{
+    if(path.includes('/status')) return {run_id:'current',running:false,phase:'finished',counters:{total_files:0,failed:0},pairs:{}}
+    if(path.includes('/tasks')) return {tasks:[]}
+    if(path.includes('/history')) return {list:[{run_id:'previous',started_at:1,phase:'finished',counters:{failed:1}}]}
+    if(path.includes('/files?')) return path.includes('run_id=previous')
+      ? {run_id:'previous',page:1,pages:1,total:1,items:[{key:'p:old',path:'old.mkv',state:'failed',size:3,error:'old error'}]}
+      : {run_id:'current',page:1,pages:1,total:0,items:[]}
+  })}
+  const wrapper=mount(AppPage,{props:{api},global:{plugins:[createVuetify({components,directives})],stubs:{VSnackbar:true}}})
+  await flushPromises()
+  await wrapper.findAll('button').find(button=>button.text().includes('历史记录')).trigger('click')
+  await flushPromises()
+  await wrapper.findAll('button').find(button=>button.text().trim()==='查看').trigger('click')
+  await flushPromises()
+  expect(wrapper.text()).toContain('正在查看历史文件明细')
+  expect(wrapper.text()).toContain('old.mkv')
+  expect(wrapper.findAll('button').filter(button=>button.text().trim()==='重试')).toHaveLength(0)
+  wrapper.unmount()
+})

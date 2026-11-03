@@ -3,17 +3,38 @@
     <div class="d-flex align-center flex-wrap ga-3 mb-4">
       <div>
         <div class="text-h5 font-weight-medium">123云盘同步</div>
-        <div class="text-body-2 text-medium-emphasis mt-1">查看任务、传输进度和最近的同步记录</div>
+        <div class="text-body-2 text-medium-emphasis mt-1">手动同步会扫描所选任务的完整源目录，请确保文件已写入完成。</div>
       </div>
       <v-spacer />
       <v-btn variant="tonal" prepend-icon="mdi-refresh" :loading="refreshing" @click="refresh(true)">刷新</v-btn>
-      <v-btn v-if="running" color="warning" variant="tonal" prepend-icon="mdi-stop" @click="cancelRun">取消同步</v-btn>
+      <v-btn v-if="running" color="warning" variant="tonal" prepend-icon="mdi-stop" :disabled="status?.external_run_active" @click="cancelRun">取消同步</v-btn>
       <v-btn color="primary" variant="flat" prepend-icon="mdi-play" :loading="starting"
              :disabled="running || !tasksLoaded || !hasEnabledTasks" @click="runAll">全部同步</v-btn>
     </div>
 
     <v-alert v-if="loadError" type="warning" variant="tonal" density="compact" class="mb-4">
       {{ loadError }} <v-btn variant="text" size="small" @click="refresh(true)">重试</v-btn>
+    </v-alert>
+    <v-alert v-if="status?.persistence_error" type="error" variant="tonal" density="compact" class="mb-4">
+      同步状态无法保存，请检查 MoviePilot 插件数据目录的空间和写入权限。修复后重新加载插件。
+    </v-alert>
+    <v-alert v-if="status?.external_run_active" type="warning" variant="tonal" density="compact" class="mb-4">
+      旧插件实例仍在结束当前任务，请等待正在进行的网络请求返回。
+    </v-alert>
+    <v-alert v-if="status?.monitor?._error" type="warning" variant="tonal" density="compact" class="mb-4">
+      {{ status.monitor._error.message }}
+    </v-alert>
+    <v-alert v-if="status?.monitor_stopped" type="warning" variant="tonal" density="compact" class="mb-4">
+      监控暂未运行，健康检查将自动尝试恢复。
+    </v-alert>
+    <v-alert v-if="status?.pending_config" type="info" variant="tonal" density="compact" class="mb-4">
+      新设置已保存，当前任务及未解决的失败处理完成后自动生效。
+    </v-alert>
+    <v-alert v-if="status?.pending_config_error" type="error" variant="tonal" density="compact" class="mb-4">
+      待生效设置无法保存或读取，请检查插件数据存储。
+    </v-alert>
+    <v-alert v-if="status?.schedule_error" type="warning" variant="tonal" density="compact" class="mb-4">
+      设置已保存，但定时服务刷新失败，请重新加载插件。
     </v-alert>
     <v-card variant="outlined" class="mb-4">
       <v-card-text>
@@ -31,6 +52,7 @@
           <v-progress-linear :model-value="overallPercent" height="10" rounded color="primary" />
           <div class="mt-2 text-body-2 text-medium-emphasis d-flex flex-wrap ga-3">
             <span>{{ fmtBytes(doneBytes) }} / {{ fmtBytes(totalBytes) }}</span><span>速度 {{ fmtSpeed(status.speed) }}</span>
+            <span>已确认传输 {{ fmtBytes(status.bytes_transferred) }}</span>
             <span v-if="status.eta">剩余 {{ fmtDuration(status.eta) }}</span><span v-if="status.elapsed">已用 {{ fmtDuration(status.elapsed) }}</span>
           </div>
           <v-row dense class="mt-3">
@@ -66,6 +88,12 @@
               <div class="path-row"><span class="text-caption text-medium-emphasis">本地源目录</span><span :title="pair.source_path">{{ pair.source_path }}</span></div>
               <div class="path-row mt-2"><span class="text-caption text-medium-emphasis">123云盘目标</span><span :title="pair.target_path">{{ pair.target_path }}</span></div>
               <v-chip size="small" variant="tonal" class="mt-3">{{ policyText(pair.policy) }}</v-chip>
+              <v-chip size="small" variant="tonal" class="mt-3 ml-2">{{ modeText(pair.trigger_mode) }}</v-chip>
+              <div v-if="pair.trigger_mode !== 'manual' && status?.monitor?.[pair.id]" class="text-caption mt-2"
+                   :class="status.monitor[pair.id].state === 'error' ? 'text-error' : 'text-medium-emphasis'">
+                {{ status.monitor[pair.id].message }} · 待处理 {{ status.monitor[pair.id].pending ?? 0 }}
+                <span v-if="status.monitor[pair.id].missing"> · 源文件不可用 {{ status.monitor[pair.id].missing }}</span>
+              </div>
               <div v-if="pairProgress(pair.id)" class="mt-3">
                 <div class="text-caption text-medium-emphasis mb-1">{{ pairProgress(pair.id).current || pairPhaseText(pair.id) }}</div>
                 <v-progress-linear :model-value="pairPercent(pair.id)" height="6" rounded color="primary" />
@@ -77,21 +105,25 @@
       </v-window-item>
       <v-window-item value="files">
         <v-card variant="outlined">
+          <v-alert v-if="historyRunId" type="info" variant="tonal" density="compact" class="ma-4 mb-0">
+            正在查看历史文件明细；历史记录只读。
+            <v-btn size="small" variant="text" @click="viewCurrentFiles">返回当前</v-btn>
+          </v-alert>
           <v-card-text class="d-flex align-center flex-wrap ga-3">
             <v-switch v-model="onlyActive" density="compact" hide-details label="只看进行中 / 失败 / 已取消" />
             <v-spacer />
-            <v-btn v-if="failedCount" variant="tonal" color="error" size="small" prepend-icon="mdi-refresh"
+            <v-btn v-if="failedCount && !historyRunId" variant="tonal" color="error" size="small" prepend-icon="mdi-refresh"
                    :disabled="running || starting" :loading="starting" @click="retryFiles()">重试全部失败（{{ failedCount }}）</v-btn>
             <span class="text-caption text-medium-emphasis">共 {{ fileTotal }} 条</span>
           </v-card-text>
-          <v-alert v-if="filesError" type="warning" variant="tonal" density="compact" class="mx-4 mb-2">文件明细读取失败 <v-btn size="small" variant="text" @click="refreshFiles">重试</v-btn></v-alert>
+          <v-alert v-if="filesError" type="warning" variant="tonal" density="compact" class="mx-4 mb-2">{{ filesError }} <v-btn size="small" variant="text" @click="refreshFiles">重试</v-btn></v-alert>
           <v-table density="compact"><thead><tr><th>文件</th><th>大小</th><th style="min-width: 160px">进度</th><th>速度</th><th>状态</th><th>操作</th></tr></thead>
             <tbody><tr v-for="file in visibleFiles" :key="file.key">
               <td :title="file.path"><div class="text-body-2">{{ shortName(file.path) }}</div><div class="text-caption text-medium-emphasis">{{ file.pair_name }}</div><div v-if="file.error" class="text-caption text-error">{{ file.error }}</div></td>
               <td>{{ fmtBytes(file.size) }}</td><td><v-progress-linear :model-value="file.percent || 0" height="6" rounded :color="fileStateColor(file.state)" /></td>
               <td>{{ fmtSpeed(file.speed) }}</td><td><v-chip :color="fileStateColor(file.state)" size="small" variant="tonal" label>{{ fileStateText(file.state) }}</v-chip></td>
-              <td><v-btn v-if="file.state === 'failed'" size="small" variant="text" color="primary" :disabled="running || starting" @click="retryFiles([file.key])">重试</v-btn></td>
-            </tr><tr v-if="!visibleFiles.length"><td colspan="6" class="text-body-2 text-medium-emphasis">{{ filesLoading ? '正在读取文件…' : (filesError ? '文件明细暂时不可用' : (fileCount ? '没有符合筛选条件的文件' : '暂无文件记录')) }}</td></tr></tbody>
+              <td><v-btn v-if="file.state === 'failed' && !historyRunId" size="small" variant="text" color="primary" :disabled="running || starting" @click="retryFiles([file.key])">重试</v-btn></td>
+            </tr><tr v-if="!visibleFiles.length"><td colspan="6" class="text-body-2 text-medium-emphasis">{{ filesLoading ? '正在读取文件…' : (filesError ? '文件明细暂时不可用' : (historyRunId ? '暂无符合筛选条件的历史文件' : (fileCount ? '没有符合筛选条件的文件' : '暂无文件记录'))) }}</td></tr></tbody>
           </v-table>
           <v-card-text v-if="fileTotal" class="d-flex align-center flex-wrap ga-2">
             <span class="text-caption text-medium-emphasis">第 {{ filePage }} / {{ filePages }} 页</span><v-spacer />
@@ -101,11 +133,12 @@
         </v-card>
       </v-window-item>
       <v-window-item value="history">
-        <v-card variant="outlined"><v-table density="compact"><thead><tr><th>开始时间</th><th>触发</th><th>结果</th><th>上传 / 秒传 / 跳过 / 失败</th><th>流量</th></tr></thead>
+        <v-card variant="outlined"><v-table density="compact"><thead><tr><th>开始时间</th><th>触发</th><th>结果</th><th>上传 / 秒传 / 跳过 / 失败</th><th>流量</th><th>文件</th></tr></thead>
           <tbody><tr v-for="item in history" :key="item.run_id"><td>{{ fmtTime(item.started_at) }}</td><td>{{ triggerText(item.trigger) }}</td>
             <td><v-chip :color="item.phase === 'finished' && item.counters?.failed ? 'warning' : phaseColorOf(item.phase)" size="small" variant="tonal" label>{{ phaseTextOf(item.phase, item.counters?.failed) }}</v-chip></td>
-            <td>{{ item.counters?.done ?? 0 }} / {{ item.counters?.instant ?? 0 }} / {{ item.counters?.skipped ?? 0 }} / {{ item.counters?.failed ?? 0 }}</td><td>{{ fmtBytes(item.bytes_done) }}</td></tr>
-            <tr v-if="!history.length"><td colspan="5" class="text-body-2 text-medium-emphasis">暂无历史记录</td></tr>
+            <td>{{ item.counters?.done ?? 0 }} / {{ item.counters?.instant ?? 0 }} / {{ item.counters?.skipped ?? 0 }} / {{ item.counters?.failed ?? 0 }}</td><td>{{ fmtBytes(item.bytes_transferred ?? item.bytes_done) }}</td>
+            <td><v-btn size="small" variant="text" @click="viewHistoryFiles(item.run_id)">查看</v-btn></td></tr>
+            <tr v-if="!history.length"><td colspan="6" class="text-body-2 text-medium-emphasis">暂无历史记录</td></tr>
           </tbody></v-table></v-card>
       </v-window-item>
     </v-window>
@@ -139,18 +172,19 @@ const tab = ref('tasks')
 const onlyActive = ref(true)
 const starting = ref(false)
 const filePage = ref(1)
+const historyRunId = ref('')
 const fileTotal = ref(0)
 const filePages = ref(1)
 const visibleFiles = ref([])
 const filesLoading = ref(false)
-const filesError = ref(false)
+const filesError = ref('')
 let fileRequestSequence = 0
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 let timer = null
 
-const running = computed(() => !!status.value?.running)
+const running = computed(() => !!status.value?.running || !!status.value?.external_run_active)
 const counters = computed(() => status.value?.counters || {})
-const doneBytes = computed(() => (status.value?.bytes_done || 0) + (status.value?.bytes_skipped || 0))
+const doneBytes = computed(() => (status.value?.bytes_done || 0) + (status.value?.bytes_skipped || 0) + (status.value?.bytes_inflight || 0))
 const totalBytes = computed(() => counters.value.total_bytes || 0)
 const overallPercent = computed(() => {
   if (!totalBytes.value) return 0
@@ -202,7 +236,10 @@ function phaseColorOf(phase) {
   return PHASE_COLOR[phase] || 'grey'
 }
 function triggerText(trigger) {
-  return ({ schedule: '定时触发', manual: '手动触发', retry: '重试失败文件' })[trigger] || trigger || '-'
+  return ({ schedule: '定时触发', manual: '手动触发', retry: '重试失败文件', monitor:'监控触发' })[trigger] || trigger || '-'
+}
+function modeText(mode) {
+  return ({ manual:'手动同步', directory:'目录监控', downloader:'下载器监控' })[mode] || '手动同步'
 }
 function shortName(path) {
   const parts = String(path).split('/')
@@ -241,23 +278,44 @@ async function refreshFiles() {
   const seq = ++fileRequestSequence
   filesLoading.value = true
   try {
-    const result = await props.api.get(`plugin/${props.pluginId}/files?page=${filePage.value}&page_size=20&active_only=${onlyActive.value}`)
+    const historyQuery = historyRunId.value ? `&run_id=${encodeURIComponent(historyRunId.value)}` : ''
+    const result = await props.api.get(`plugin/${props.pluginId}/files?page=${filePage.value}&page_size=20&active_only=${onlyActive.value}${historyQuery}`)
     if (seq !== fileRequestSequence) return
+    if (result?.success === false) throw new Error(result.message || '文件明细不可用')
     // A new run can start while status and page requests are in flight.
-    if (status.value?.run_id && result?.run_id !== status.value.run_id) {
-      filesError.value = true
+    if (!historyRunId.value && status.value?.run_id && result?.run_id !== status.value.run_id) {
+      visibleFiles.value = []
+      fileTotal.value = 0
+      filesError.value = '同步记录已变化，正在刷新'
       return
     }
     visibleFiles.value = result?.items || []
     fileTotal.value = result?.total || 0
     filePages.value = result?.pages || 1
     if (result?.page && filePage.value !== result.page) filePage.value = result.page
-    filesError.value = false
+    filesError.value = ''
   } catch (e) {
-    if (seq === fileRequestSequence) filesError.value = true
+    if (seq === fileRequestSequence) {
+      visibleFiles.value = []
+      fileTotal.value = 0
+      filePages.value = 1
+      filesError.value = e?.message || '文件明细读取失败'
+    }
   } finally {
     if (seq === fileRequestSequence) filesLoading.value = false
   }
+}
+
+function viewHistoryFiles(runId) {
+  historyRunId.value = runId || ''
+  filePage.value = 1
+  tab.value = 'files'
+  refreshFiles()
+}
+function viewCurrentFiles() {
+  historyRunId.value = ''
+  filePage.value = 1
+  refreshFiles()
 }
 
 async function retryFiles(fileKeys = []) {
