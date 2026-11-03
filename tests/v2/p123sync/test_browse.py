@@ -77,3 +77,22 @@ def test_remote_browsing_and_login_use_isolated_cached_session(plugin_module, mo
 def test_root_source_is_preserved(plugin_module):
     pair = plugin_module.TaskPairConfig.from_dict({'source_path': '/', 'target_path': '/'})
     assert pair.source_path == '/'
+
+
+def test_versioned_frontend_and_dashboard_registration(plugin_module):
+    plugin = plugin_module.P123Sync()
+    assert plugin.plugin_version == '1.2.0'
+    assert plugin.get_render_mode() == ('vue', 'dist/v1_2_0')
+    assert plugin.get_dashboard() == ({'cols': 12, 'md': 6}, {'border': False}, None)
+
+
+def test_versioned_federated_asset_references_exist(plugin_module):
+    import re
+    plugin_dir = Path(__file__).resolve().parents[3] / 'plugins.v2' / 'p123sync'
+    asset_dir = plugin_dir / plugin_module.P123Sync().get_render_mode()[1]
+    entry = asset_dir / 'remoteEntry.js'
+    assert entry.is_file()
+    for asset in asset_dir.glob('*.js'):
+        content = asset.read_text(encoding='utf-8')
+        for filename in re.findall(r'["\'](?:\./)?((?:__federation_|_plugin-vue_|utils-)[^"\']+\.(?:js|css))["\']', content):
+            assert (asset_dir / filename).is_file(), f'{asset.name}: missing {filename}'

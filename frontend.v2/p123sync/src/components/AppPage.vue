@@ -1,182 +1,101 @@
 <template>
   <div class="p123sync-apppage pa-4">
-    <!-- 顶部概览 -->
-    <v-card class="mb-4">
-      <v-card-title class="d-flex flex-wrap align-center ga-3">
-        <v-icon icon="mdi-cloud-sync-outline" />
-        123云盘同步
-        <v-chip v-if="status" :color="phaseColor" label size="small">{{ phaseText }}</v-chip>
-        <v-chip v-if="status?.trigger" size="small" variant="tonal">
-          {{ status.trigger === 'schedule' ? '定时触发' : '手动触发' }}
-        </v-chip>
-        <v-spacer />
-        <v-btn color="primary" variant="flat" prepend-icon="mdi-play"
-               :loading="starting" :disabled="running" @click="runAll">
-          全部同步
-        </v-btn>
-        <v-btn color="warning" variant="tonal" prepend-icon="mdi-stop"
-               :disabled="!running" @click="cancelRun">
-          取消
-        </v-btn>
-      </v-card-title>
+    <div class="d-flex align-center flex-wrap ga-3 mb-4">
+      <div>
+        <div class="text-h5 font-weight-medium">123云盘同步</div>
+        <div class="text-body-2 text-medium-emphasis mt-1">查看任务、传输进度和最近的同步记录</div>
+      </div>
+      <v-spacer />
+      <v-btn variant="tonal" prepend-icon="mdi-refresh" :loading="refreshing" @click="refresh(true)">刷新</v-btn>
+      <v-btn v-if="running" color="warning" variant="tonal" prepend-icon="mdi-stop" @click="cancelRun">取消同步</v-btn>
+      <v-btn color="primary" variant="flat" prepend-icon="mdi-play" :loading="starting"
+             :disabled="running || !tasksLoaded || !hasEnabledTasks" @click="runAll">全部同步</v-btn>
+    </div>
 
-      <v-card-text v-if="status && status.started_at">
-        <v-row>
-          <v-col cols="12" md="6">
-            <div class="text-body-2 mb-1">
-              {{ status.phase_detail || (running ? '处理中…' : '空闲') }}
-            </div>
-            <v-progress-linear :model-value="overallPercent" height="14" rounded color="primary" />
-            <div class="mt-2 text-body-2 text-medium-emphasis">
-              {{ fmtBytes(doneBytes) }} / {{ fmtBytes(totalBytes) }}
-              · 速度 {{ fmtSpeed(status.speed) }}
-              <span v-if="status.eta">· 预计剩余 {{ fmtDuration(status.eta) }}</span>
-              <span v-if="status.elapsed">· 已用 {{ fmtDuration(status.elapsed) }}</span>
-            </div>
-          </v-col>
-          <v-col cols="6" sm="3" md="2" v-for="item in counterItems" :key="item.key">
-            <div class="text-h6">{{ status.counters?.[item.key] ?? 0 }}</div>
-            <div class="text-caption text-medium-emphasis">{{ item.label }}</div>
-          </v-col>
-        </v-row>
-        <v-alert v-if="status.error" type="error" density="compact" class="mt-2">
-          {{ status.error }}
-        </v-alert>
-      </v-card-text>
-      <v-card-text v-else class="text-body-2 text-medium-emphasis">
-        尚未运行过同步。配置好任务对后点「全部同步」。
+    <v-alert v-if="loadError" type="warning" variant="tonal" density="compact" class="mb-4">
+      {{ loadError }} <v-btn variant="text" size="small" @click="refresh(true)">重试</v-btn>
+    </v-alert>
+    <v-card variant="outlined" class="mb-4">
+      <v-card-text>
+        <div class="d-flex align-center flex-wrap ga-2 mb-3">
+          <span class="text-subtitle-1 font-weight-medium">{{ status?.started_at ? '同步概览' : '准备就绪' }}</span>
+          <v-chip v-if="status" :color="phaseColor" variant="tonal" size="small" label>{{ phaseText }}</v-chip>
+          <v-chip v-if="status?.started_at" size="small" variant="tonal">{{ status.trigger === 'schedule' ? '定时触发' : '手动触发' }}</v-chip>
+          <v-spacer />
+          <span v-if="status?.started_at" class="text-caption text-medium-emphasis">{{ fmtTime(status.started_at) }}</span>
+        </div>
+        <template v-if="status?.started_at">
+          <div class="d-flex justify-space-between ga-2 text-body-2 mb-2">
+            <span>{{ status.phase_detail || phaseText }}</span><span>{{ Math.round(overallPercent) }}%</span>
+          </div>
+          <v-progress-linear :model-value="overallPercent" height="10" rounded color="primary" />
+          <div class="mt-2 text-body-2 text-medium-emphasis d-flex flex-wrap ga-3">
+            <span>{{ fmtBytes(doneBytes) }} / {{ fmtBytes(totalBytes) }}</span><span>速度 {{ fmtSpeed(status.speed) }}</span>
+            <span v-if="status.eta">剩余 {{ fmtDuration(status.eta) }}</span><span v-if="status.elapsed">已用 {{ fmtDuration(status.elapsed) }}</span>
+          </div>
+          <v-row dense class="mt-3">
+            <v-col v-for="item in counterItems" :key="item.key" cols="6" sm="3">
+              <div class="stat-box pa-3"><div class="text-h6">{{ status.counters?.[item.key] ?? 0 }}</div>
+                <div class="text-caption text-medium-emphasis">{{ item.label }}</div></div>
+            </v-col>
+          </v-row>
+          <v-alert v-if="status.error" type="error" density="compact" class="mt-3">{{ status.error }}</v-alert>
+        </template>
+        <div v-else class="text-body-2 text-medium-emphasis">{{ hasEnabledTasks ? '选择“全部同步”或运行单个任务。' : '请先在插件设置中添加并启用任务。' }}</div>
       </v-card-text>
     </v-card>
 
-    <v-tabs v-model="tab" density="compact" class="mb-2">
-      <v-tab value="tasks">任务对</v-tab>
-      <v-tab value="files">
-        文件明细
-        <v-chip v-if="fileCount" size="x-small" class="ml-2">{{ fileCount }}</v-chip>
-      </v-tab>
-      <v-tab value="history">历史</v-tab>
+    <v-tabs v-model="tab" density="compact" color="primary" class="mb-3">
+      <v-tab value="tasks">同步任务 <v-chip size="x-small" class="ml-2">{{ pairs.length }}</v-chip></v-tab>
+      <v-tab value="files">文件明细 <v-chip v-if="fileCount" size="x-small" class="ml-2">{{ fileCount }}</v-chip></v-tab>
+      <v-tab value="history">历史记录</v-tab>
     </v-tabs>
-
-    <!-- 任务对 -->
     <v-window v-model="tab">
       <v-window-item value="tasks">
-        <v-card v-if="pairs.length" class="mb-3">
-          <v-list lines="three">
-            <v-list-item v-for="pair in pairs" :key="pair.id">
-              <template #prepend>
-                <v-icon :icon="pair.enabled ? 'mdi-folder-sync-outline' : 'mdi-folder-off-outline'"
-                        :color="pair.enabled ? 'primary' : 'grey'" />
-              </template>
-              <v-list-item-title class="d-flex align-center ga-2 flex-wrap">
-                <span>{{ pair.name || pair.source_path }}</span>
-                <v-chip size="x-small" variant="tonal">{{ policyText(pair.policy) }}</v-chip>
-                <v-chip v-if="!pair.enabled" size="x-small" color="grey">已停用</v-chip>
-              </v-list-item-title>
-              <v-list-item-subtitle>
-                {{ pair.source_path }} → 123云盘:{{ pair.target_path }}
-              </v-list-item-subtitle>
-              <template #append>
-                <v-btn size="small" variant="tonal" color="primary"
-                       :disabled="running || !pair.enabled" @click="runOne(pair.id)">
-                  同步
-                </v-btn>
-              </template>
-              <div v-if="pairProgress(pair.id)" class="pr-14">
-                <v-progress-linear :model-value="pairPercent(pair.id)" height="8" rounded class="my-1" />
-                <div class="text-caption text-medium-emphasis">
-                  {{ pairProgress(pair.id).current || pairPhaseText(pair.id) }}
-                </div>
+        <div v-if="pairs.length" class="task-grid">
+          <v-card v-for="pair in pairs" :key="pair.id" variant="outlined">
+            <v-card-text>
+              <div class="d-flex align-center flex-wrap ga-2 mb-3">
+                <v-icon :icon="pair.enabled ? 'mdi-folder-sync-outline' : 'mdi-folder-off-outline'" :color="pair.enabled ? 'primary' : 'grey'" />
+                <span class="text-subtitle-1 font-weight-medium task-title">{{ pair.name || pair.source_path }}</span>
+                <v-chip v-if="!pair.enabled" size="x-small">已停用</v-chip><v-spacer />
+                <v-btn size="small" variant="tonal" color="primary" prepend-icon="mdi-play"
+                       :disabled="running || starting || !pair.enabled" @click="runOne(pair.id)">同步</v-btn>
               </div>
-            </v-list-item>
-          </v-list>
-        </v-card>
-        <v-card v-else>
-          <v-card-text class="text-body-2 text-medium-emphasis">
-            还没有配置任务对，请到插件设置中添加。
-          </v-card-text>
-        </v-card>
+              <div class="path-row"><span class="text-caption text-medium-emphasis">本地源目录</span><span :title="pair.source_path">{{ pair.source_path }}</span></div>
+              <div class="path-row mt-2"><span class="text-caption text-medium-emphasis">123云盘目标</span><span :title="pair.target_path">{{ pair.target_path }}</span></div>
+              <v-chip size="small" variant="tonal" class="mt-3">{{ policyText(pair.policy) }}</v-chip>
+              <div v-if="pairProgress(pair.id)" class="mt-3">
+                <div class="text-caption text-medium-emphasis mb-1">{{ pairProgress(pair.id).current || pairPhaseText(pair.id) }}</div>
+                <v-progress-linear :model-value="pairPercent(pair.id)" height="6" rounded color="primary" />
+              </div>
+            </v-card-text>
+          </v-card>
+        </div>
+        <v-card v-else variant="outlined"><v-card-text class="text-body-2 text-medium-emphasis">{{ tasksLoaded ? '还没有同步任务，请在插件设置中添加。' : '正在读取任务…' }}</v-card-text></v-card>
       </v-window-item>
-
-      <!-- 文件明细 -->
       <v-window-item value="files">
-        <v-card>
-          <v-card-text class="d-flex align-center ga-3">
-            <v-switch v-model="onlyActive" density="compact" hide-details
-                      label="只看进行中/失败" />
-            <v-spacer />
-            <span class="text-caption text-medium-emphasis">共 {{ visibleFiles.length }} 条</span>
+        <v-card variant="outlined">
+          <v-card-text class="d-flex align-center flex-wrap ga-3">
+            <v-switch v-model="onlyActive" density="compact" hide-details label="只看进行中 / 失败 / 已取消" />
+            <v-spacer /><span class="text-caption text-medium-emphasis">显示 {{ visibleFiles.length }} / {{ fileCount }} 条</span>
           </v-card-text>
-          <v-table density="compact">
-            <thead>
-              <tr>
-                <th class="text-left">文件</th>
-                <th class="text-left">大小</th>
-                <th class="text-left" style="min-width: 180px">进度</th>
-                <th class="text-left">速度</th>
-                <th class="text-left">状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="file in visibleFiles" :key="file.key">
-                <td class="text-body-2" :title="file.path">
-                  {{ shortName(file.path) }}
-                  <div class="text-caption text-medium-emphasis">{{ file.pair_name }}</div>
-                  <div v-if="file.error" class="text-caption text-error">{{ file.error }}</div>
-                </td>
-                <td class="text-body-2">{{ fmtBytes(file.size) }}</td>
-                <td>
-                  <v-progress-linear :model-value="file.percent || 0" height="6" rounded
-                                     :color="fileStateColor(file.state)" />
-                </td>
-                <td class="text-body-2">{{ fmtSpeed(file.speed) }}</td>
-                <td>
-                  <v-chip :color="fileStateColor(file.state)" size="small" label>
-                    {{ fileStateText(file.state) }}
-                  </v-chip>
-                </td>
-              </tr>
-              <tr v-if="!visibleFiles.length">
-                <td colspan="5" class="text-body-2 text-medium-emphasis">暂无记录</td>
-              </tr>
-            </tbody>
+          <v-table density="compact"><thead><tr><th>文件</th><th>大小</th><th style="min-width: 160px">进度</th><th>速度</th><th>状态</th></tr></thead>
+            <tbody><tr v-for="file in visibleFiles" :key="file.key">
+              <td :title="file.path"><div class="text-body-2">{{ shortName(file.path) }}</div><div class="text-caption text-medium-emphasis">{{ file.pair_name }}</div><div v-if="file.error" class="text-caption text-error">{{ file.error }}</div></td>
+              <td>{{ fmtBytes(file.size) }}</td><td><v-progress-linear :model-value="file.percent || 0" height="6" rounded :color="fileStateColor(file.state)" /></td>
+              <td>{{ fmtSpeed(file.speed) }}</td><td><v-chip :color="fileStateColor(file.state)" size="small" variant="tonal" label>{{ fileStateText(file.state) }}</v-chip></td>
+            </tr><tr v-if="!visibleFiles.length"><td colspan="5" class="text-body-2 text-medium-emphasis">{{ fileCount ? '没有符合筛选条件的文件' : '暂无文件记录' }}</td></tr></tbody>
           </v-table>
         </v-card>
       </v-window-item>
-
-      <!-- 历史 -->
       <v-window-item value="history">
-        <v-card>
-          <v-table density="compact">
-            <thead>
-              <tr>
-                <th class="text-left">开始时间</th>
-                <th class="text-left">触发</th>
-                <th class="text-left">结果</th>
-                <th class="text-left">上传/秒传/跳过/失败</th>
-                <th class="text-left">流量</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="item in history" :key="item.run_id">
-                <td class="text-body-2">{{ fmtTime(item.started_at) }}</td>
-                <td class="text-body-2">{{ item.trigger === 'schedule' ? '定时' : '手动' }}</td>
-                <td>
-                  <v-chip :color="phaseColorOf(item.phase)" size="small" label>
-                    {{ phaseTextOf(item.phase) }}
-                  </v-chip>
-                </td>
-                <td class="text-body-2">
-                  {{ item.counters?.done ?? 0 }} / {{ item.counters?.instant ?? 0 }} /
-                  {{ item.counters?.skipped ?? 0 }} / {{ item.counters?.failed ?? 0 }}
-                </td>
-                <td class="text-body-2">{{ fmtBytes(item.bytes_done) }}</td>
-              </tr>
-              <tr v-if="!history.length">
-                <td colspan="5" class="text-body-2 text-medium-emphasis">暂无历史</td>
-              </tr>
-            </tbody>
-          </v-table>
-        </v-card>
+        <v-card variant="outlined"><v-table density="compact"><thead><tr><th>开始时间</th><th>触发</th><th>结果</th><th>上传 / 秒传 / 跳过 / 失败</th><th>流量</th></tr></thead>
+          <tbody><tr v-for="item in history" :key="item.run_id"><td>{{ fmtTime(item.started_at) }}</td><td>{{ item.trigger === 'schedule' ? '定时' : '手动' }}</td>
+            <td><v-chip :color="phaseColorOf(item.phase)" size="small" variant="tonal" label>{{ phaseTextOf(item.phase) }}</v-chip></td>
+            <td>{{ item.counters?.done ?? 0 }} / {{ item.counters?.instant ?? 0 }} / {{ item.counters?.skipped ?? 0 }} / {{ item.counters?.failed ?? 0 }}</td><td>{{ fmtBytes(item.bytes_done) }}</td></tr>
+            <tr v-if="!history.length"><td colspan="5" class="text-body-2 text-medium-emphasis">暂无历史记录</td></tr>
+          </tbody></v-table></v-card>
       </v-window-item>
     </v-window>
 
@@ -201,6 +120,10 @@ const props = defineProps({
 
 const status = ref(null)
 const history = ref([])
+const tasks = ref([])
+const tasksLoaded = ref(false)
+const loadError = ref('')
+const refreshing = ref(false)
 const tab = ref('tasks')
 const onlyActive = ref(true)
 const starting = ref(false)
@@ -224,10 +147,8 @@ const counterItems = [
   { key: 'failed', label: '失败' },
 ]
 
-const pairs = computed(() => {
-  const map = status.value?.pairs || {}
-  return Object.values(map)
-})
+const pairs = computed(() => tasks.value)
+const hasEnabledTasks = computed(() => pairs.value.some(pair => pair.enabled))
 
 const fileCount = computed(() => status.value?.files?.length || 0)
 const visibleFiles = computed(() => {
@@ -276,14 +197,23 @@ function toast(text, color = 'success') {
 }
 
 async function refresh(full = false) {
+  if (refreshing.value) return
+  refreshing.value = true
   try {
-    status.value = await props.api.get(`plugin/${props.pluginId}/status`)
-    if (full) {
-      const hist = await props.api.get(`plugin/${props.pluginId}/history`)
-      history.value = hist?.list || []
+    const calls = [props.api.get(`plugin/${props.pluginId}/status`)]
+    if (full || !tasksLoaded.value) {
+      calls.push(props.api.get(`plugin/${props.pluginId}/tasks`), props.api.get(`plugin/${props.pluginId}/history`))
     }
-  } catch (e) {
-    /* transient */
+    const results = await Promise.allSettled(calls)
+    if (results[0].status === 'fulfilled') status.value = results[0].value
+    if (results.length > 1 && results[1].status === 'fulfilled') {
+      tasks.value = results[1].value?.tasks || []
+      tasksLoaded.value = true
+    }
+    if (results.length > 2 && results[2].status === 'fulfilled') history.value = results[2].value?.list || []
+    loadError.value = results.some(result => result.status === 'rejected') ? '部分数据读取失败，页面可能不是最新状态。' : ''
+  } finally {
+    refreshing.value = false
   }
 }
 
@@ -339,4 +269,9 @@ onUnmounted(() => {
   max-width: 1200px;
   margin: 0 auto;
 }
+.stat-box { background: rgba(var(--v-theme-on-surface), .04); border-radius: 10px; }
+.task-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 12px; }
+.task-title { min-width: 0; overflow-wrap: anywhere; }
+.path-row { display: flex; flex-direction: column; gap: 2px; font-size: .875rem; overflow-wrap: anywhere; }
+
 </style>

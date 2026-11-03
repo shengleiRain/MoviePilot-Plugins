@@ -1,19 +1,12 @@
 <template>
-  <v-card>
-    <v-card-title>123云盘同步</v-card-title>
-    <v-card-subtitle>本地目录单向同步到123云盘（免识别整树复制）</v-card-subtitle>
-    <v-card-text>
-      <p class="text-body-2">
-        在左侧栏打开「123云盘同步」页面可查看任务状态与实时进度；插件设置中配置账号、
-        同步任务对与定时。同步不经过 MoviePilot 的识别整理链，未识别内容会原样上传。
-      </p>
-      <p class="text-body-2 text-medium-emphasis">
-        同名策略支持：相同大小跳过 / 覆盖（旧文件进123回收站）/ 保留两者（自动改名）。
-        秒传命中时零流量完成。
-      </p>
-    </v-card-text>
-  </v-card>
+  <v-card variant="flat"><v-card-text>
+    <div class="d-flex align-center ga-3 mb-4"><v-avatar color="primary" variant="tonal" rounded="lg"><v-icon icon="mdi-cloud-sync-outline" /></v-avatar><div><div class="text-h6">123云盘同步</div><div class="text-body-2 text-medium-emphasis">本地目录 → 123云盘</div></div></div>
+    <p class="text-body-2 mb-3">按目录原样同步文件，无需经过识别和整理。先在插件设置中添加任务，再通过侧栏页面查看进度或手动同步。</p>
+    <v-row dense>
+      <v-col cols="12" sm="4"><v-card variant="tonal" class="pa-3"><div class="text-subtitle-2">选择目录</div><div class="text-caption mt-1">浏览已有文件夹，也可手动输入</div></v-card></v-col>
+      <v-col cols="12" sm="4"><v-card variant="tonal" class="pa-3"><div class="text-subtitle-2">灵活同步</div><div class="text-caption mt-1">手动执行或设置定时计划</div></v-card></v-col>
+      <v-col cols="12" sm="4"><v-card variant="tonal" class="pa-3"><div class="text-subtitle-2">查看进度</div><div class="text-caption mt-1">追踪任务、文件和历史记录</div></v-card></v-col>
+    </v-row>
+    <div class="text-caption text-medium-emphasis mt-4">同名文件可选择跳过、覆盖或保留两者；覆盖时旧文件会移入 123 云盘回收站。</div>
+  </v-card-text></v-card>
 </template>
-
-<script setup>
-</script>
