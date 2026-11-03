@@ -20,7 +20,7 @@
         <div class="d-flex align-center flex-wrap ga-2 mb-3">
           <span class="text-subtitle-1 font-weight-medium">{{ status?.started_at ? '同步概览' : '准备就绪' }}</span>
           <v-chip v-if="status" :color="phaseColor" variant="tonal" size="small" label>{{ phaseText }}</v-chip>
-          <v-chip v-if="status?.started_at" size="small" variant="tonal">{{ status.trigger === 'schedule' ? '定时触发' : '手动触发' }}</v-chip>
+          <v-chip v-if="status?.started_at" size="small" variant="tonal">{{ triggerText(status.trigger) }}</v-chip>
           <v-spacer />
           <span v-if="status?.started_at" class="text-caption text-medium-emphasis">{{ fmtTime(status.started_at) }}</span>
         </div>
@@ -40,6 +40,7 @@
             </v-col>
           </v-row>
           <v-alert v-if="status.error" type="error" density="compact" class="mt-3">{{ status.error }}</v-alert>
+          <div v-if="status.phase === 'error' && !failedCount" class="text-caption text-medium-emphasis mt-2">请到下方同步任务中重新运行相应任务。</div>
         </template>
         <div v-else class="text-body-2 text-medium-emphasis">{{ hasEnabledTasks ? '选择“全部同步”或运行单个任务。' : '请先在插件设置中添加并启用任务。' }}</div>
       </v-card-text>
@@ -78,21 +79,31 @@
         <v-card variant="outlined">
           <v-card-text class="d-flex align-center flex-wrap ga-3">
             <v-switch v-model="onlyActive" density="compact" hide-details label="只看进行中 / 失败 / 已取消" />
-            <v-spacer /><span class="text-caption text-medium-emphasis">显示 {{ visibleFiles.length }} / {{ fileCount }} 条</span>
+            <v-spacer />
+            <v-btn v-if="failedCount" variant="tonal" color="error" size="small" prepend-icon="mdi-refresh"
+                   :disabled="running || starting" :loading="starting" @click="retryFiles()">重试全部失败（{{ failedCount }}）</v-btn>
+            <span class="text-caption text-medium-emphasis">共 {{ fileTotal }} 条</span>
           </v-card-text>
-          <v-table density="compact"><thead><tr><th>文件</th><th>大小</th><th style="min-width: 160px">进度</th><th>速度</th><th>状态</th></tr></thead>
+          <v-alert v-if="filesError" type="warning" variant="tonal" density="compact" class="mx-4 mb-2">文件明细读取失败 <v-btn size="small" variant="text" @click="refreshFiles">重试</v-btn></v-alert>
+          <v-table density="compact"><thead><tr><th>文件</th><th>大小</th><th style="min-width: 160px">进度</th><th>速度</th><th>状态</th><th>操作</th></tr></thead>
             <tbody><tr v-for="file in visibleFiles" :key="file.key">
               <td :title="file.path"><div class="text-body-2">{{ shortName(file.path) }}</div><div class="text-caption text-medium-emphasis">{{ file.pair_name }}</div><div v-if="file.error" class="text-caption text-error">{{ file.error }}</div></td>
               <td>{{ fmtBytes(file.size) }}</td><td><v-progress-linear :model-value="file.percent || 0" height="6" rounded :color="fileStateColor(file.state)" /></td>
               <td>{{ fmtSpeed(file.speed) }}</td><td><v-chip :color="fileStateColor(file.state)" size="small" variant="tonal" label>{{ fileStateText(file.state) }}</v-chip></td>
-            </tr><tr v-if="!visibleFiles.length"><td colspan="5" class="text-body-2 text-medium-emphasis">{{ fileCount ? '没有符合筛选条件的文件' : '暂无文件记录' }}</td></tr></tbody>
+              <td><v-btn v-if="file.state === 'failed'" size="small" variant="text" color="primary" :disabled="running || starting" @click="retryFiles([file.key])">重试</v-btn></td>
+            </tr><tr v-if="!visibleFiles.length"><td colspan="6" class="text-body-2 text-medium-emphasis">{{ filesLoading ? '正在读取文件…' : (filesError ? '文件明细暂时不可用' : (fileCount ? '没有符合筛选条件的文件' : '暂无文件记录')) }}</td></tr></tbody>
           </v-table>
+          <v-card-text v-if="fileTotal" class="d-flex align-center flex-wrap ga-2">
+            <span class="text-caption text-medium-emphasis">第 {{ filePage }} / {{ filePages }} 页</span><v-spacer />
+            <v-btn size="small" variant="tonal" :disabled="filePage <= 1 || filesLoading" @click="filePage--">上一页</v-btn>
+            <v-btn size="small" variant="tonal" :disabled="filePage >= filePages || filesLoading" @click="filePage++">下一页</v-btn>
+          </v-card-text>
         </v-card>
       </v-window-item>
       <v-window-item value="history">
         <v-card variant="outlined"><v-table density="compact"><thead><tr><th>开始时间</th><th>触发</th><th>结果</th><th>上传 / 秒传 / 跳过 / 失败</th><th>流量</th></tr></thead>
-          <tbody><tr v-for="item in history" :key="item.run_id"><td>{{ fmtTime(item.started_at) }}</td><td>{{ item.trigger === 'schedule' ? '定时' : '手动' }}</td>
-            <td><v-chip :color="phaseColorOf(item.phase)" size="small" variant="tonal" label>{{ phaseTextOf(item.phase) }}</v-chip></td>
+          <tbody><tr v-for="item in history" :key="item.run_id"><td>{{ fmtTime(item.started_at) }}</td><td>{{ triggerText(item.trigger) }}</td>
+            <td><v-chip :color="item.phase === 'finished' && item.counters?.failed ? 'warning' : phaseColorOf(item.phase)" size="small" variant="tonal" label>{{ phaseTextOf(item.phase, item.counters?.failed) }}</v-chip></td>
             <td>{{ item.counters?.done ?? 0 }} / {{ item.counters?.instant ?? 0 }} / {{ item.counters?.skipped ?? 0 }} / {{ item.counters?.failed ?? 0 }}</td><td>{{ fmtBytes(item.bytes_done) }}</td></tr>
             <tr v-if="!history.length"><td colspan="5" class="text-body-2 text-medium-emphasis">暂无历史记录</td></tr>
           </tbody></v-table></v-card>
@@ -106,7 +117,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   fmtBytes, fmtSpeed, fmtDuration, fmtTime,
   PHASE_TEXT, PHASE_COLOR, FILE_STATE_TEXT, FILE_STATE_COLOR, POLICY_TEXT,
@@ -127,6 +138,13 @@ const refreshing = ref(false)
 const tab = ref('tasks')
 const onlyActive = ref(true)
 const starting = ref(false)
+const filePage = ref(1)
+const fileTotal = ref(0)
+const filePages = ref(1)
+const visibleFiles = ref([])
+const filesLoading = ref(false)
+const filesError = ref(false)
+let fileRequestSequence = 0
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 let timer = null
 
@@ -138,8 +156,10 @@ const overallPercent = computed(() => {
   if (!totalBytes.value) return 0
   return Math.min((doneBytes.value / totalBytes.value) * 100, 100)
 })
-const phaseText = computed(() => PHASE_TEXT[status.value?.phase] || status.value?.phase || '')
-const phaseColor = computed(() => PHASE_COLOR[status.value?.phase] || 'grey')
+const phaseText = computed(() => status.value?.phase === 'finished' && failedCount.value
+  ? '已完成（有失败）' : (PHASE_TEXT[status.value?.phase] || status.value?.phase || ''))
+const phaseColor = computed(() => status.value?.phase === 'finished' && failedCount.value
+  ? 'warning' : (PHASE_COLOR[status.value?.phase] || 'grey'))
 const counterItems = [
   { key: 'done', label: '已上传' },
   { key: 'instant', label: '秒传' },
@@ -150,12 +170,8 @@ const counterItems = [
 const pairs = computed(() => tasks.value)
 const hasEnabledTasks = computed(() => pairs.value.some(pair => pair.enabled))
 
-const fileCount = computed(() => status.value?.files?.length || 0)
-const visibleFiles = computed(() => {
-  const files = status.value?.files || []
-  if (!onlyActive.value) return files
-  return files.filter(f => ['uploading', 'failed', 'cancelled'].includes(f.state))
-})
+const fileCount = computed(() => status.value?.counters?.total_files || 0)
+const failedCount = computed(() => status.value?.counters?.failed || 0)
 
 function pairProgress(pairId) {
   return status.value?.pairs?.[pairId] || null
@@ -179,11 +195,14 @@ function fileStateText(state) {
 function fileStateColor(state) {
   return FILE_STATE_COLOR[state] || 'grey'
 }
-function phaseTextOf(phase) {
-  return PHASE_TEXT[phase] || phase
+function phaseTextOf(phase, failed) {
+  return phase === 'finished' && failed ? '已完成（有失败）' : (PHASE_TEXT[phase] || phase)
 }
 function phaseColorOf(phase) {
   return PHASE_COLOR[phase] || 'grey'
+}
+function triggerText(trigger) {
+  return ({ schedule: '定时触发', manual: '手动触发', retry: '重试失败文件' })[trigger] || trigger || '-'
 }
 function shortName(path) {
   const parts = String(path).split('/')
@@ -200,7 +219,7 @@ async function refresh(full = false) {
   if (refreshing.value) return
   refreshing.value = true
   try {
-    const calls = [props.api.get(`plugin/${props.pluginId}/status`)]
+    const calls = [props.api.get(`plugin/${props.pluginId}/status?include_files=false`)]
     if (full || !tasksLoaded.value) {
       calls.push(props.api.get(`plugin/${props.pluginId}/tasks`), props.api.get(`plugin/${props.pluginId}/history`))
     }
@@ -212,10 +231,56 @@ async function refresh(full = false) {
     }
     if (results.length > 2 && results[2].status === 'fulfilled') history.value = results[2].value?.list || []
     loadError.value = results.some(result => result.status === 'rejected') ? '部分数据读取失败，页面可能不是最新状态。' : ''
+    await refreshFiles()
   } finally {
     refreshing.value = false
   }
 }
+
+async function refreshFiles() {
+  const seq = ++fileRequestSequence
+  filesLoading.value = true
+  try {
+    const result = await props.api.get(`plugin/${props.pluginId}/files?page=${filePage.value}&page_size=20&active_only=${onlyActive.value}`)
+    if (seq !== fileRequestSequence) return
+    // A new run can start while status and page requests are in flight.
+    if (status.value?.run_id && result?.run_id !== status.value.run_id) {
+      filesError.value = true
+      return
+    }
+    visibleFiles.value = result?.items || []
+    fileTotal.value = result?.total || 0
+    filePages.value = result?.pages || 1
+    if (result?.page && filePage.value !== result.page) filePage.value = result.page
+    filesError.value = false
+  } catch (e) {
+    if (seq === fileRequestSequence) filesError.value = true
+  } finally {
+    if (seq === fileRequestSequence) filesLoading.value = false
+  }
+}
+
+async function retryFiles(fileKeys = []) {
+  if (!status.value?.run_id || running.value || starting.value) return
+  starting.value = true
+  try {
+    const result = await props.api.post(`plugin/${props.pluginId}/retry`, {
+      run_id: status.value.run_id, file_keys: fileKeys,
+    })
+    toast(result?.message || (result?.success ? '重试已开始' : '重试失败'), result?.success ? 'success' : 'error')
+    await refresh(true)
+  } catch (e) {
+    toast(`重试失败：${e}`, 'error')
+  } finally {
+    starting.value = false
+  }
+}
+
+watch(onlyActive, () => {
+  if (filePage.value !== 1) filePage.value = 1
+  else refreshFiles()
+})
+watch(filePage, refreshFiles)
 
 async function triggerRun(payload) {
   starting.value = true

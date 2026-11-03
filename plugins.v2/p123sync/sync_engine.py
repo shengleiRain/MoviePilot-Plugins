@@ -55,7 +55,6 @@ COUNTERED_STATES = (FILE_PENDING, FILE_UPLOADING, FILE_DONE, FILE_INSTANT,
 TEMP_SUFFIXES = (".tmp", ".temp", ".part", ".!qb", ".downloading")
 HIDDEN_PREFIXES = (".", "~$")
 JUNK_NAMES = ("thumbs.db", "desktop.ini")
-MAX_TRACKED_FILES = 5000
 
 
 def _normalize_source_path(path: str) -> str:
@@ -223,8 +222,10 @@ class RunState:
         self.bytes_skipped = 0
         self.speed = 0.0
         self.files: List[Dict] = []
+        self._file_index: Dict[str, Dict] = {}
         self.pairs: Dict[str, Dict] = {}
         self._speed_window: List[Tuple[float, int]] = []
+        self._retry_prior_error: Optional[str] = None
 
     # -- engine-thread mutations ---------------------------------------------
 
@@ -234,6 +235,7 @@ class RunState:
             self.started_at = time.time()
             self.finished_at = None
             self.error = None
+            self._retry_prior_error = None
             self.counters = {state: 0 for state in COUNTERED_STATES}
             self.counters.update({"total_files": 0, "total_bytes": 0})
             self.bytes_done = 0
@@ -241,10 +243,12 @@ class RunState:
             self.speed = 0.0
             self._speed_window = []
             self.files = []
+            self._file_index = {}
             self.pairs = {
                 pair.id: {
                     "id": pair.id, "name": pair.name,
                     "source": pair.source_path, "target": pair.target_path,
+                    "policy": pair.policy, "exclude_ext": list(pair.exclude_ext),
                     "phase": PHASE_IDLE, "current": "",
                     "total": 0, "done": 0, "instant": 0, "skipped": 0, "failed": 0,
                 }
@@ -268,8 +272,29 @@ class RunState:
                 self.counters["total_files"] += 1
                 self.counters["total_bytes"] += record.get("size") or 0
                 self.counters[FILE_PENDING] += 1
-                if len(self.files) < MAX_TRACKED_FILES:
-                    self.files.append(record)
+                self.files.append(record)
+                self._file_index[record["key"]] = record
+
+    def begin_retry(self, keys: Iterable[str]):
+        """Requeue only selected failures while retaining the other records."""
+        with self._lock:
+            self._retry_prior_error = self.error if self.phase in (PHASE_ERROR, PHASE_CANCELLED) else None
+            self.run_id = uuid.uuid4().hex[:12]
+            self.trigger = "retry"
+            self.phase = PHASE_SCANNING
+            self.phase_detail = "重试失败文件"
+            self.started_at = time.time()
+            self.finished_at = None
+            self.error = None
+            self.speed = 0.0
+            self._speed_window = []
+            for key in keys:
+                record = self._file_index[key]
+                self._transition(record, FILE_PENDING, 0.0, 0.0, None)
+                record["error"] = None
+                pair = self.pairs.get(record["pair_id"])
+                if pair:
+                    pair["failed"] = max(pair["failed"] - 1, 0)
 
     def _transition(self, record: Dict, state: str, percent: Optional[float],
                     speed: Optional[float], error: Optional[str]):
@@ -291,7 +316,7 @@ class RunState:
                   speed: Optional[float] = None, error: Optional[str] = None,
                   bytes_done: Optional[int] = None):
         with self._lock:
-            record = next((f for f in reversed(self.files) if f["key"] == rel_key), None)
+            record = self._file_index.get(rel_key)
             if record is None:
                 return
             self._transition(record, state, percent, speed, error)
@@ -302,6 +327,12 @@ class RunState:
     def add_skipped_bytes(self, size: int):
         with self._lock:
             self.bytes_skipped += size
+
+    def update_retry_file_size(self, key: str, size: int):
+        with self._lock:
+            record = self._file_index[key]
+            self.counters["total_bytes"] += size - record["size"]
+            record["size"] = size
 
     def tick_speed(self):
         """Recompute overall speed from a 10s sliding window."""
@@ -318,16 +349,28 @@ class RunState:
 
     def finish(self, phase: str, error: Optional[str] = None):
         with self._lock:
+            if self._retry_prior_error:
+                if phase == PHASE_FINISHED:
+                    phase, error = PHASE_ERROR, self._retry_prior_error
+                elif phase == PHASE_CANCELLED:
+                    error = self._retry_prior_error
+                elif phase == PHASE_ERROR and error and error != self._retry_prior_error:
+                    error = f"原任务错误：{self._retry_prior_error}；重试错误：{error}"
             self.phase = phase
             self.error = error
             self.finished_at = time.time()
             for record in self.files:
                 if record.get("state") in (FILE_PENDING, FILE_UPLOADING):
-                    self._transition(record, FILE_CANCELLED, None, None, None)
+                    retry_cancelled = phase == PHASE_CANCELLED and self.trigger == "retry"
+                    target = FILE_FAILED if phase == PHASE_ERROR or retry_cancelled else FILE_CANCELLED
+                    reason = "重试已取消" if retry_cancelled else (error if phase == PHASE_ERROR else None)
+                    self._transition(record, target, None, 0.0, reason)
+                    if target == FILE_FAILED and record.get("pair_id") in self.pairs:
+                        self.pairs[record["pair_id"]]["failed"] += 1
 
     # -- reads ---------------------------------------------------------------
 
-    def snapshot(self) -> Dict:
+    def snapshot(self, include_files: bool = True) -> Dict:
         with self._lock:
             elapsed = (self.finished_at or time.time()) - (self.started_at or time.time())
             remaining = max(
@@ -349,11 +392,25 @@ class RunState:
                 "error": self.error,
                 "running": self.phase in RUNNING_PHASES,
                 "pairs": {pid: dict(pair) for pid, pair in self.pairs.items()},
-                "files": [dict(f) for f in self.files],
+                "files": [dict(f) for f in self.files] if include_files else [],
             }
 
+    def files_page(self, page: int = 1, page_size: int = 20, active_only: bool = False) -> Dict:
+        with self._lock:
+            page = max(1, page)
+            page_size = max(1, min(page_size, 100))
+            items = [f for f in self.files if not active_only or
+                     f.get("state") in (FILE_UPLOADING, FILE_FAILED, FILE_CANCELLED)]
+            total = len(items)
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = min(page, pages)
+            start = (page - 1) * page_size
+            return {"run_id": self.run_id, "page": page, "page_size": page_size,
+                    "total": total, "pages": pages,
+                    "items": [dict(f) for f in items[start:start + page_size]]}
+
     def summary(self) -> Dict:
-        snap = self.snapshot()
+        snap = self.snapshot(include_files=False)
         snap["files"] = []
         snap["pairs"] = {
             pid: {k: pair[k] for k in ("name", "source", "target", "phase",
@@ -385,15 +442,17 @@ class SyncEngine:
 
     # ---------------------------------------------------------------- public
 
-    def run(self, pairs: List[TaskPairConfig]) -> Dict:
+    def run(self, pairs: List[TaskPairConfig], retry_paths: Optional[Dict[str, set]] = None,
+            already_started: bool = False) -> Dict:
         """Blocking run over all pairs. Returns the run summary."""
-        self.state.begin(pairs)
+        if not already_started:
+            self.state.begin(pairs)
         self.log(f"同步开始 run={self.state.run_id}，共 {len(pairs)} 个任务对")
         try:
             for pair in pairs:
                 if self.cancel_event.is_set():
                     break
-                self._run_pair(pair)
+                self._run_pair(pair, None if retry_paths is None else retry_paths[pair.id])
             if self.cancel_event.is_set():
                 self.state.finish(PHASE_CANCELLED)
                 self.log("同步已取消")
@@ -466,10 +525,28 @@ class SyncEngine:
 
     # ----------------------------------------------------------------- pair
 
-    def _run_pair(self, pair: TaskPairConfig):
+    def _run_pair(self, pair: TaskPairConfig, retry_paths: Optional[set] = None):
         self.state.set_phase(PHASE_SCANNING, pair.name)
         self.state.pair_update(pair.id, phase=PHASE_SCANNING, current=pair.source_path)
         local_files = scan_source(pair.source_path, pair.exclude_ext)
+        previous = self.state.snapshot(include_files=False)["pairs"].get(pair.id, {})
+        done = previous.get("done", 0) if retry_paths is not None else 0
+        instant = previous.get("instant", 0) if retry_paths is not None else 0
+        skipped = previous.get("skipped", 0) if retry_paths is not None else 0
+        failed = previous.get("failed", 0) if retry_paths is not None else 0
+        if retry_paths is not None:
+            local_files = [f for f in local_files if f.rel_path in retry_paths]
+            for local in local_files:
+                self.state.update_retry_file_size(f"{pair.id}:{local.rel_path}", local.size)
+            missing = retry_paths - {f.rel_path for f in local_files}
+            for rel_path in sorted(missing):
+                self.state.mark_file(f"{pair.id}:{rel_path}", FILE_FAILED,
+                                     error="源文件不存在、无法读取或已被排除")
+                failed += 1
+            self.state.pair_update(pair.id, failed=failed)
+            if not local_files:
+                self.state.pair_update(pair.id, phase=PHASE_FINISHED, current="")
+                return
         self.log(f"[{pair.name}] 本地扫描完成: {len(local_files)} 个文件")
 
         self.state.set_phase(PHASE_LISTING, pair.name)
@@ -478,23 +555,25 @@ class SyncEngine:
         self.log(f"[{pair.name}] 远端列举完成: {len(remote_map)} 个文件")
 
         actions = plan_sync(local_files, remote_map, pair.policy)
-        self.state.add_files([
-            {
-                "key": f"{pair.id}:{action.local.rel_path}",
-                "pair_id": pair.id,
-                "pair_name": pair.name,
-                "path": action.local.rel_path,
-                "size": action.local.size,
-                "state": FILE_PENDING,
-                "percent": 0.0,
-                "speed": 0.0,
-                "error": None,
-            }
-            for action in actions
-        ])
-        self.state.pair_update(pair.id, phase=PHASE_UPLOADING, total=len(actions), current="")
+        if retry_paths is None:
+            self.state.add_files([
+                {
+                    "key": f"{pair.id}:{action.local.rel_path}",
+                    "pair_id": pair.id,
+                    "pair_name": pair.name,
+                    "path": action.local.rel_path,
+                    "size": action.local.size,
+                    "state": FILE_PENDING,
+                    "percent": 0.0,
+                    "speed": 0.0,
+                    "error": None,
+                }
+                for action in actions
+            ])
+        self.state.pair_update(pair.id, phase=PHASE_UPLOADING,
+                               total=previous.get("total", 0) if retry_paths is not None else len(actions),
+                               current="")
 
-        done = instant = skipped = failed = 0
         for action in actions:
             if self._cancelled():
                 break

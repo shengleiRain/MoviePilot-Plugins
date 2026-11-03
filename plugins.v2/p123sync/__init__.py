@@ -60,6 +60,11 @@ class RunRequest(BaseModel):
     task_ids: List[str] = Field(default_factory=list)
 
 
+class RetryRequest(BaseModel):
+    run_id: str
+    file_keys: List[str] = Field(default_factory=list)
+
+
 class SaveConfigRequest(BaseModel):
     """Body for POST /save_config."""
 
@@ -78,7 +83,7 @@ class P123Sync(_PluginBase):
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录单向同步到123云盘：免识别整树复制、同名策略可配、秒传/分片上传，侧栏页面实时查看任务与进度。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -96,6 +101,7 @@ class P123Sync(_PluginBase):
         self._client: Optional[P123SyncClient] = None
         self._state = RunState(trigger="manual")
         self._run_lock = threading.Lock()
+        self._run_in_progress = False
         self._browse_lock = threading.Lock()
         self._browse_client: Optional[P123SyncClient] = None
         self._browse_credentials = None
@@ -140,6 +146,13 @@ class P123Sync(_PluginBase):
                 "summary": "当前/最近一次同步状态与逐文件进度",
             },
             {
+                "path": "/files",
+                "endpoint": self.api_files,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "分页读取当前同步文件",
+            },
+            {
                 "path": "/history",
                 "endpoint": self.api_history,
                 "methods": ["GET"],
@@ -159,6 +172,13 @@ class P123Sync(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "立即同步（可选指定任务对）",
+            },
+            {
+                "path": "/retry",
+                "endpoint": self.api_retry,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "重试最近一次同步的失败文件",
             },
             {
                 "path": "/cancel",
@@ -221,7 +241,7 @@ class P123Sync(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
         """Vue federated frontend with a versioned asset directory."""
-        return "vue", "dist/v1_3_0"
+        return "vue", "dist/v1_4_0"
 
     def get_dashboard(self, key: str = "", user_agent: str = None) -> Tuple[dict, dict, None]:
         """Register the federated Dashboard with the MoviePilot host."""
@@ -271,8 +291,12 @@ class P123Sync(_PluginBase):
 
     # ------------------------------------------------------------------ api
 
-    def api_status(self) -> Dict[str, Any]:
-        return self._state.snapshot()
+    def api_status(self, include_files: bool = True) -> Dict[str, Any]:
+        return self._state.snapshot(include_files=include_files)
+
+    def api_files(self, page: int = 1, page_size: int = 20,
+                  active_only: bool = False) -> Dict[str, Any]:
+        return self._state.files_page(page, page_size, active_only)
 
     def api_history(self) -> Dict[str, Any]:
         return {"list": self._load_history()}
@@ -303,8 +327,47 @@ class P123Sync(_PluginBase):
         ok, message = self._start_run(pairs, trigger="manual")
         return {"success": ok, "message": message}
 
+    def api_retry(self, request: RetryRequest) -> Dict[str, Any]:
+        with self._run_lock:
+            if self._run_in_progress:
+                return {"success": False, "message": "已有同步在运行中"}
+            snap = self._state.snapshot()
+            if request.run_id != snap["run_id"]:
+                return {"success": False, "message": "同步记录已变化，请刷新后重试"}
+            failures = {f["key"]: f for f in snap["files"] if f.get("state") == "failed"}
+            selected = set(request.file_keys) if request.file_keys else set(failures)
+            if not selected or not selected.issubset(failures):
+                return {"success": False, "message": "没有可重试的失败文件，请刷新后重试"}
+            pair_map = {pair.id: pair for pair in self._pairs if pair.enabled}
+            retry_paths: Dict[str, set] = {}
+            for key in selected:
+                record = failures[key]
+                pair = pair_map.get(record["pair_id"])
+                old = snap["pairs"].get(record["pair_id"], {})
+                if not pair or any((old.get("source") != pair.source_path,
+                                    old.get("target") != pair.target_path,
+                                    old.get("policy") != pair.policy,
+                                    old.get("exclude_ext") != pair.exclude_ext)):
+                    return {"success": False, "message": "任务配置已更改或停用，请重新运行该任务"}
+                retry_paths.setdefault(pair.id, set()).add(record["path"])
+            pairs = [pair_map[pid] for pid in retry_paths]
+            self._run_in_progress = True
+            self._cancel_event = threading.Event()
+            state = self._state
+            state.begin_retry(selected)
+            self._worker = threading.Thread(target=self._sync_worker,
+                                            args=(pairs, state, self._cancel_event, retry_paths),
+                                            name="p123sync-retry", daemon=True)
+            try:
+                self._worker.start()
+            except Exception as err:
+                self._run_in_progress = False
+                state.finish(PHASE_ERROR, str(err))
+                return {"success": False, "message": f"无法启动重试：{err}"}
+            return {"success": True, "message": f"已开始重试 {len(selected)} 个失败文件"}
+
     def api_cancel(self) -> Dict[str, Any]:
-        if not self._state.snapshot().get("running"):
+        if not self._state.snapshot(include_files=False).get("running"):
             return {"success": False, "message": "当前没有运行中的同步"}
         self._cancel_event.set()
         return {"success": True, "message": "已请求取消"}
@@ -414,11 +477,13 @@ class P123Sync(_PluginBase):
     def _start_run(self, pairs: List[TaskPairConfig], trigger: str) -> Tuple[bool, str]:
         """Single-flight launcher for manual runs (own daemon thread)."""
         with self._run_lock:
-            if self._state.snapshot().get("running"):
+            if self._run_in_progress:
                 return False, "已有同步在运行中"
+            self._run_in_progress = True
             self._cancel_event = threading.Event()
             self._state = RunState(trigger=trigger)
             state = self._state
+            state.begin(pairs)
             cancel_event = self._cancel_event
             self._worker = threading.Thread(
                 target=self._sync_worker,
@@ -426,7 +491,12 @@ class P123Sync(_PluginBase):
                 name="p123sync-worker",
                 daemon=True,
             )
-            self._worker.start()
+            try:
+                self._worker.start()
+            except Exception as err:
+                self._run_in_progress = False
+                state.finish(PHASE_ERROR, str(err))
+                return False, f"无法启动同步：{err}"
             return True, f"同步已开始（{len(pairs)} 个任务对）"
 
     def _scheduled_sync(self):
@@ -435,45 +505,51 @@ class P123Sync(_PluginBase):
         if not pairs:
             return
         with self._run_lock:
-            if self._state.snapshot().get("running"):
+            if self._run_in_progress:
                 logger.info(f"{LOG_PREFIX}定时触发跳过：已有同步在运行")
                 return
+            self._run_in_progress = True
             self._cancel_event = threading.Event()
             self._state = RunState(trigger="schedule")
-        self._sync_worker(pairs, self._state, self._cancel_event)
+            state = self._state
+            cancel_event = self._cancel_event
+            state.begin(pairs)
+        self._sync_worker(pairs, state, cancel_event)
 
     def _sync_worker(self, pairs: List[TaskPairConfig], state: RunState,
-                     cancel_event: threading.Event):
+                     cancel_event: threading.Event, retry_paths: Optional[Dict[str, set]] = None):
         try:
             client = self._get_client()
+            engine = SyncEngine(
+                client=client,
+                logger=lambda msg: logger.info(f"{LOG_PREFIX}{msg}"),
+                cancel_event=cancel_event,
+                state=state,
+            )
+            engine.run(pairs, retry_paths=retry_paths, already_started=True)
         except Exception as err:  # noqa: BLE001
-            state.begin(pairs)
             state.finish(PHASE_ERROR, str(err))
-            logger.error(f"{LOG_PREFIX}客户端初始化失败: {err}")
-            return
-        engine = SyncEngine(
-            client=client,
-            logger=lambda msg: logger.info(f"{LOG_PREFIX}{msg}"),
-            cancel_event=cancel_event,
-            state=state,
-        )
-        try:
-            summary = engine.run(pairs)
+            logger.error(f"{LOG_PREFIX}同步启动失败: {err}")
         finally:
             self._persist_history(summary=state.summary())
+            with self._run_lock:
+                self._run_in_progress = False
         self._notify_result(state)
 
     def _notify_result(self, state: RunState):
         if not self._notify:
             return
-        counters = state.snapshot()["counters"]
-        phase = state.snapshot()["phase"]
+        snapshot = state.snapshot(include_files=False)
+        counters = snapshot["counters"]
+        phase = snapshot["phase"]
         titles = {
             PHASE_FINISHED: "123云盘同步完成",
             PHASE_CANCELLED: "123云盘同步已取消",
             PHASE_ERROR: "123云盘同步失败",
         }
         title = titles.get(phase)
+        if phase == PHASE_FINISHED and counters.get("failed", 0):
+            title = "123云盘同步完成（有失败）"
         if not title:
             return
         text = (

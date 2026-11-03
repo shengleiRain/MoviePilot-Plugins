@@ -22,8 +22,10 @@ let timer = null
 let pending = false
 const running = computed(() => !!status.value?.running)
 const phase = computed(() => status.value?.phase || null)
-const phaseText = computed(() => PHASE_TEXT[phase.value] || phase.value || '')
-const phaseColor = computed(() => PHASE_COLOR[phase.value] || 'grey')
+const phaseText = computed(() => phase.value === 'finished' && status.value?.counters?.failed
+  ? '已完成（有失败）' : (PHASE_TEXT[phase.value] || phase.value || ''))
+const phaseColor = computed(() => phase.value === 'finished' && status.value?.counters?.failed
+  ? 'warning' : (PHASE_COLOR[phase.value] || 'grey'))
 const doneBytes = computed(() => (status.value?.bytes_done || 0) + (status.value?.bytes_skipped || 0))
 const totalBytes = computed(() => status.value?.counters?.total_bytes || 0)
 const overallPercent = computed(() => totalBytes.value ? Math.min(doneBytes.value / totalBytes.value * 100, 100) : 0)
@@ -31,7 +33,7 @@ const metrics = [{key:'done',label:'已上传'}, {key:'instant',label:'秒传'},
 async function refresh() {
   if (pending) return
   pending = true
-  try { status.value = await props.api.get(`plugin/${props.pluginId}/status`); error.value = false }
+  try { status.value = await props.api.get(`plugin/${props.pluginId}/status?include_files=false`); error.value = false }
   catch { error.value = true }
   finally { pending = false }
 }

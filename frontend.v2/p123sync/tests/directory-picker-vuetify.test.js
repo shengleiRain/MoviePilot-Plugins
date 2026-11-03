@@ -20,6 +20,7 @@ it('opens a real Vuetify tree under the field and updates the chosen folder', as
     props: { api, pluginId:'P123Sync', label:'本地目录', modelValue:'/' },
     global: { plugins: [createVuetify({ components, directives })] },
   })
+  expect(wrapper.find('.v-field--variant-outlined').exists()).toBe(true)
   await wrapper.get('input').trigger('click')
   await flushPromises()
   const folder = [...document.querySelectorAll('.v-list-item')].find(el => el.textContent.trim() === '电影')

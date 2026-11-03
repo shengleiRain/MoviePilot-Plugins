@@ -323,3 +323,118 @@ def test_run_state_counter_transitions():
     assert snap["counters"]["uploading"] == 0
     assert snap["counters"]["done"] == 1
     assert snap["bytes_done"] == 10
+
+
+def test_retry_only_selected_failure_preserves_other_results(local_tree):
+    class RetryClient(FakeClient):
+        failing = {'e01.mkv', 'e02.mkv'}
+        def upload(self, local_path, parent_file_id, name, on_progress=None, cancel_check=None):
+            if name in self.failing:
+                raise RuntimeError('temporary error')
+            return super().upload(local_path, parent_file_id, name, on_progress, cancel_check)
+
+    client = RetryClient(remote=_populated_remote())
+    pair = make_pair(local_tree.parent, policy=engine_mod.POLICY_OVERWRITE, exclude_ext=['.nfo'])
+    state, _ = run_engine(client, [pair])
+    previous_id = state.run_id
+    assert state.snapshot()['counters']['failed'] == 2
+    client.failing.remove('e01.mkv')
+    client.uploads.clear()
+    client.trashed.clear()
+    path = 'Season 1/e01.mkv'
+    state.begin_retry({f't1:{path}'})
+    eng = engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state)
+    eng.run([pair], retry_paths={'t1': {path}}, already_started=True)
+    snapshot = state.snapshot()
+    assert snapshot['run_id'] != previous_id and snapshot['trigger'] == 'retry'
+    assert snapshot['counters']['failed'] == 1 and snapshot['counters']['done'] == 2
+    assert [entry['state'] for entry in snapshot['files'] if entry['path'].endswith('e02.mkv')] == ['failed']
+    assert [name for _, name, _ in client.uploads] == ['e01.mkv']
+    assert client.trashed == [501]  # no successful or unselected files are overwritten
+
+
+def test_retry_missing_source_stays_failed(local_tree):
+    class FailingClient(FakeClient):
+        def upload(self, *args, **kwargs):
+            raise RuntimeError('failed')
+    client = FailingClient(remote=_populated_remote())
+    pair = make_pair(local_tree.parent, policy=engine_mod.POLICY_OVERWRITE, exclude_ext=['.nfo'])
+    state, _ = run_engine(client, [pair])
+    file_path = local_tree / 'a.txt'
+    file_path.unlink()
+    state.begin_retry({'t1:a.txt'})
+    client.trashed.clear()
+    engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state).run(
+        [pair], retry_paths={'t1': {'a.txt'}}, already_started=True)
+    failure = next(f for f in state.snapshot()['files'] if f['path'] == 'a.txt')
+    assert failure['state'] == 'failed' and '源文件不存在' in failure['error']
+    assert client.trashed == []
+
+
+def test_pagination_tracks_files_beyond_previous_limit():
+    state = engine_mod.RunState()
+    state.begin([])
+    state.add_files([{'key': f'k{i}', 'path': f'{i}.mkv', 'size': 1,
+                      'state': 'pending', 'percent': 0, 'speed': 0, 'error': None}
+                     for i in range(5002)])
+    state.mark_file('k5001', 'failed', error='failed')
+    assert state.snapshot(include_files=False)['files'] == []
+    assert state.files_page(251, 20)['items'][-1]['key'] == 'k5001'
+    filtered = state.files_page(1, 20, active_only=True)
+    assert filtered['total'] == 1 and filtered['items'][0]['key'] == 'k5001'
+    assert state.snapshot()['counters']['failed'] == 1
+
+
+def test_retry_listing_failure_preserves_retryable_records(local_tree):
+    class BrokenClient(FakeClient):
+        fail_listing = False
+        def upload(self, *args, **kwargs):
+            raise RuntimeError('upload failed')
+        def walk(self, *args, **kwargs):
+            if self.fail_listing:
+                raise RuntimeError('listing unavailable')
+            yield from super().walk(*args, **kwargs)
+    client = BrokenClient(remote=_populated_remote())
+    pair = make_pair(local_tree.parent, policy=engine_mod.POLICY_OVERWRITE, exclude_ext=['.nfo'])
+    state, _ = run_engine(client, [pair])
+    assert state.snapshot()['counters']['failed'] == 3
+    client.fail_listing = True
+    selected = {'t1:a.txt'}
+    state.begin_retry(selected)
+    engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state).run(
+        [pair], retry_paths={'t1': {'a.txt'}}, already_started=True)
+    snapshot = state.snapshot()
+    assert snapshot['phase'] == 'error'
+    assert snapshot['counters']['failed'] == 3
+    assert snapshot['pairs']['t1']['failed'] == 3
+    record = next(f for f in snapshot['files'] if f['key'] == 't1:a.txt')
+    assert record['state'] == 'failed' and 'listing unavailable' in record['error']
+
+
+def test_retry_keeps_original_run_error_visible_and_cancelled_retry_is_retryable(local_tree):
+    pair = make_pair(local_tree.parent)
+    state = engine_mod.RunState()
+    state.begin([pair])
+    state.add_files([{'key':'t1:a.txt', 'pair_id':'t1', 'path':'a.txt', 'size':3,
+                      'state':'pending', 'percent':0, 'speed':0, 'error':None}])
+    state.mark_file('t1:a.txt', 'failed', error='upload error')
+    state.pair_update('t1', failed=1, total=1)
+    state.finish('error', 'another task could not be listed')
+    state.begin_retry({'t1:a.txt'})
+    state.mark_file('t1:a.txt', 'done', percent=100, bytes_done=3)
+    state.finish('finished')
+    assert state.snapshot()['phase'] == 'error'
+    assert state.snapshot()['error'] == 'another task could not be listed'
+
+    state2 = engine_mod.RunState()
+    state2.begin([pair])
+    state2.add_files([{'key':'t1:a.txt', 'pair_id':'t1', 'path':'a.txt', 'size':3,
+                       'state':'pending', 'percent':0, 'speed':0, 'error':None}])
+    state2.mark_file('t1:a.txt', 'failed', error='upload error')
+    state2.pair_update('t1', failed=1, total=1)
+    state2.finish('finished')
+    state2.begin_retry({'t1:a.txt'})
+    state2.finish('cancelled')
+    snap = state2.snapshot()
+    assert snap['phase'] == 'cancelled' and snap['counters']['failed'] == 1
+    assert snap['files'][0]['state'] == 'failed' and snap['files'][0]['error'] == '重试已取消'

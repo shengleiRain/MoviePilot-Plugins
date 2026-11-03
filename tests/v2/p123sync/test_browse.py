@@ -81,8 +81,8 @@ def test_root_source_is_preserved(plugin_module):
 
 def test_versioned_frontend_and_dashboard_registration(plugin_module):
     plugin = plugin_module.P123Sync()
-    assert plugin.plugin_version == '1.3.0'
-    assert plugin.get_render_mode() == ('vue', 'dist/v1_3_0')
+    assert plugin.plugin_version == '1.4.0'
+    assert plugin.get_render_mode() == ('vue', 'dist/v1_4_0')
     assert plugin.get_dashboard() == ({'cols': 12, 'md': 6}, {'border': False}, None)
 
 
@@ -96,3 +96,51 @@ def test_versioned_federated_asset_references_exist(plugin_module):
         content = asset.read_text(encoding='utf-8')
         for filename in re.findall(r'["\'](?:\./)?((?:__federation_|_plugin-vue_|utils-)[^"\']+\.(?:js|css))["\']', content):
             assert (asset_dir / filename).is_file(), f'{asset.name}: missing {filename}'
+
+
+def test_retry_endpoint_keeps_other_failures_and_rejects_stale_config(plugin_module, monkeypatch, tmp_path):
+    started = []
+    class FakeThread:
+        def __init__(self, **kwargs): self.kwargs = kwargs
+        def start(self): started.append(self.kwargs)
+    monkeypatch.setattr(plugin_module.threading, 'Thread', FakeThread)
+    plugin = plugin_module.P123Sync()
+    pair = plugin_module.TaskPairConfig(id='p1', name='Test', source_path=str(tmp_path),
+                                        target_path='/backup', policy='overwrite')
+    plugin._pairs = [pair]
+    plugin._state.begin([pair])
+    plugin._state.add_files([
+        {'key':f'p1:{name}', 'pair_id':'p1', 'path':name, 'size':1,
+         'state':'pending', 'percent':0, 'speed':0, 'error':None}
+        for name in ('a.mkv', 'b.mkv')
+    ])
+    plugin._state.mark_file('p1:a.mkv', 'failed', error='a failed')
+    plugin._state.mark_file('p1:b.mkv', 'failed', error='b failed')
+    plugin._state.pair_update('p1', failed=2, total=2)
+    plugin._state.finish(plugin_module.PHASE_FINISHED)
+    original_id = plugin._state.run_id
+    result = plugin.api_retry(plugin_module.RetryRequest(run_id=original_id, file_keys=['p1:a.mkv']))
+    assert result['success'] and len(started) == 1
+    snap = plugin._state.snapshot()
+    assert snap['run_id'] != original_id and snap['running']
+    assert {f['key']: f['state'] for f in snap['files']} == {'p1:a.mkv':'pending', 'p1:b.mkv':'failed'}
+    assert not plugin.api_retry(plugin_module.RetryRequest(run_id=snap['run_id']))['success']
+    # Simulate a completed worker and an intervening configuration edit.
+    plugin._run_in_progress = False
+    plugin._state.finish(plugin_module.PHASE_ERROR, 'stopped')
+    assert not plugin.api_retry(plugin_module.RetryRequest(run_id=original_id))['success']
+    pair.target_path = '/changed'
+    result = plugin.api_retry(plugin_module.RetryRequest(run_id=plugin._state.run_id))
+    assert not result['success'] and '配置已更改' in result['message']
+
+
+def test_single_flight_starts_before_worker_runs(plugin_module, monkeypatch, tmp_path):
+    class FakeThread:
+        def __init__(self, **kwargs): pass
+        def start(self): pass
+    monkeypatch.setattr(plugin_module.threading, 'Thread', FakeThread)
+    plugin = plugin_module.P123Sync()
+    pair = plugin_module.TaskPairConfig(id='p', name='Test', source_path=str(tmp_path), target_path='/')
+    assert plugin._start_run([pair], 'manual')[0]
+    assert plugin._state.snapshot()['running']
+    assert not plugin._start_run([pair], 'manual')[0]

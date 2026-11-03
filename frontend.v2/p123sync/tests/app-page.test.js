@@ -52,3 +52,38 @@ describe('sync task page', () => {
     wrapper.unmount()
   })
 })
+
+it('paginates failures from the API and retries only the selected record', async () => {
+  const files = Array.from({length: 25}, (_, index) => ({
+    key: `p1:file-${String(index).padStart(2, '0')}.mkv`, path: `file-${String(index).padStart(2, '0')}.mkv`,
+    pair_name: '电影', size: 1, state: 'failed', error: 'network', percent: 0,
+  }))
+  const api = {
+    get: vi.fn(async path => {
+      if (path.includes('/status')) return { run_id:'run-1', running:false, phase:'finished', started_at:1, counters:{total_files:25,failed:25}, pairs:{} }
+      if (path.includes('/tasks')) return {tasks:[]}
+      if (path.includes('/history')) return {list:[]}
+      if (path.includes('/files?')) {
+        const page = Number(new URL(`https://example.test/${path}`).searchParams.get('page'))
+        return { run_id:'run-1', page, pages:2, total:25, items:files.slice((page-1)*20, page*20) }
+      }
+      throw new Error(`Unexpected: ${path}`)
+    }),
+    post: vi.fn(async () => ({success:true, message:'已开始重试'})),
+  }
+  const wrapper = mount(AppPage, { props:{api}, global:{plugins:[createVuetify({components, directives})], stubs:{VSnackbar:true}} })
+  await flushPromises()
+  const tab = wrapper.findAll('button').find(button => button.text().includes('文件明细'))
+  await tab.trigger('click')
+  await flushPromises()
+  expect(wrapper.text()).toContain('file-00.mkv')
+  expect(wrapper.text()).not.toContain('file-20.mkv')
+  await wrapper.findAll('button').find(button => button.text().trim() === '下一页').trigger('click')
+  await flushPromises()
+  expect(wrapper.text()).toContain('file-20.mkv')
+  expect(wrapper.text()).not.toContain('file-00.mkv')
+  await wrapper.findAll('button').find(button => button.text().trim() === '重试').trigger('click')
+  await flushPromises()
+  expect(api.post).toHaveBeenCalledWith('plugin/P123Sync/retry', { run_id:'run-1', file_keys:['p1:file-20.mkv'] })
+  wrapper.unmount()
+})

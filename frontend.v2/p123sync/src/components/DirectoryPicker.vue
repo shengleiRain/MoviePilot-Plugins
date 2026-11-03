@@ -3,7 +3,7 @@
           content-class="p123sync-directory-menu">
     <template #activator="{ props: menuProps }">
       <v-text-field v-bind="menuProps" :model-value="modelValue" :label="label"
-                    :placeholder="placeholder" variant="underlined" density="compact" hide-details
+                    :placeholder="placeholder" variant="outlined" density="compact" hide-details
                     @update:model-value="emit('update:modelValue', $event)" />
     </template>
     <v-card class="directory-dropdown" elevation="4">
