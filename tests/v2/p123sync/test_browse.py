@@ -88,8 +88,8 @@ def test_root_source_is_preserved(plugin_module):
 
 def test_versioned_frontend_and_dashboard_registration(plugin_module):
     plugin = plugin_module.P123Sync()
-    assert plugin.plugin_version == '1.7.0'
-    assert plugin.get_render_mode() == ('vue', 'dist/v1_7_0')
+    assert plugin.plugin_version == '1.7.1'
+    assert plugin.get_render_mode() == ('vue', 'dist/v1_7_1')
     assert plugin.get_dashboard() == ({'cols': 12, 'md': 6}, {'border': False}, None)
 
 
@@ -200,14 +200,57 @@ def test_pending_recovery_blocks_changing_account_and_starting_new_run(plugin_mo
 
 def test_client_rejects_incomplete_pagination(plugin_module, monkeypatch):
     client = plugin_module.P123SyncClient('account', 'secret', page_interval=0)
-    monkeypatch.setattr(client, '_checked', lambda *_: {'data': {'InfoList': [], 'Next': 5}})
+    monkeypatch.setattr(client, '_checked', lambda *_, **__: {'data': {'InfoList': [], 'Next': '', 'Total': 2}})
     with pytest.raises(plugin_module.P123ClientError, match='分页中断'):
         client.list_dir(0)
-    monkeypatch.setattr(client, '_checked', lambda *_: {'data': {'InfoList': []}})
-    with pytest.raises(plugin_module.P123ClientError, match='缺少列表或分页'):
+    monkeypatch.setattr(client, '_checked', lambda *_, **__: {'data': {'InfoList': []}})
+    with pytest.raises(plugin_module.P123ClientError, match='缺少列表或总数'):
         client.list_dir(0)
-    monkeypatch.setattr(client, '_checked', lambda *_: {'data': {'InfoList': [], 'Next': -1}})
+    monkeypatch.setattr(client, '_checked', lambda *_, **__: {'data': {'InfoList': [], 'Next': '', 'Total': 0}})
     assert client.list_dir(0) == []
+
+
+def test_page_based_directory_listing_collects_all_508_entries(plugin_module, monkeypatch):
+    client = plugin_module.P123SyncClient('account', 'secret', page_interval=0)
+    calls = []
+    def checked(method, path, *, params):
+        assert method == 'request' and path == 'file/list/new' and params['driveId'] == 0
+        page = params['Page']; calls.append(page)
+        start = (page-1)*100
+        return {'data': {'InfoList': [{'FileId':i, 'FileName':str(i), 'Type':0} for i in range(start, min(start+100,508))],
+                         'Total':508, 'Next':-1 if page == 6 else ''}}
+    monkeypatch.setattr(client, '_checked', checked)
+    assert len(client.list_dir(7)) == 508 and calls == [1,2,3,4,5,6]
+
+
+def test_page_based_listing_rejects_duplicate_ids_and_changed_totals(plugin_module, monkeypatch):
+    client = plugin_module.P123SyncClient('account', 'secret', page_interval=0)
+    monkeypatch.setattr(client, '_checked', lambda *_, **__: {'data': {
+        'InfoList':[{'FileId':1,'FileName':'a'},{'FileId':1,'FileName':'a'}], 'Total':2}})
+    with pytest.raises(plugin_module.P123ClientError, match='分页重复'):
+        client.list_dir(7)
+    def changed(_method, _path, *, params):
+        page=params['Page']
+        return {'data': {'InfoList':[{'FileId':page,'FileName':str(page)}], 'Total':2 if page==1 else 3}}
+    monkeypatch.setattr(client, '_checked', changed)
+    with pytest.raises(plugin_module.P123ClientError, match='列举期间发生变化'):
+        client.list_dir(7)
+
+
+def test_directory_rate_limit_retries_and_cancellation(plugin_module, monkeypatch):
+    client = plugin_module.P123SyncClient('account', 'secret', page_interval=0)
+    calls, waits = [], []
+    def checked(*args, **kwargs):
+        calls.append(1)
+        if len(calls) < 3:
+            raise plugin_module.P123ClientError('throttled', service_code=100011, operation='request')
+        return {'data': {'InfoList':[], 'Total':0, 'Next':''}}
+    monkeypatch.setattr(client, '_checked', checked)
+    monkeypatch.setattr(client, '_wait', lambda seconds, cancel=None: waits.append(seconds))
+    assert client.list_dir(7) == [] and len(calls) == 3
+    assert 2 in waits and 4 in waits
+    with pytest.raises(KeyboardInterrupt):
+        client.list_dir(7, cancel_check=lambda: True)
 
 
 def test_client_instant_upload_does_not_count_as_network_transfer(plugin_module, monkeypatch, tmp_path):
@@ -223,6 +266,34 @@ def test_client_instant_upload_does_not_count_as_network_transfer(plugin_module,
     assert client.upload(sample, 0, 'a.mkv', on_progress=progress.append) == (123, True)
     assert requests[0][1]['duplicate'] == 0
     assert progress == []
+
+
+def test_cloud_error_keeps_numeric_code_without_exposing_response(plugin_module, monkeypatch):
+    client = plugin_module.P123SyncClient('account', 'secret')
+    client.client = SimpleNamespace(call=lambda *args, **kwargs: {
+        'code': 429, 'message': 'private secret', 'data': {'token': 'private token'}})
+    client_module = sys.modules[plugin_module.P123SyncClient.__module__]
+    monkeypatch.setattr(client_module, 'check_response',
+                        lambda resp: (_ for _ in ()).throw(OSError(str(resp))))
+    with pytest.raises(plugin_module.P123ClientError) as error:
+        client._checked('upload_request')
+    assert '云盘错误码 429' in str(error.value)
+    assert error.value.service_code == 429 and error.value.operation == 'upload_request'
+    assert 'private' not in str(error.value)
+
+
+def test_cloud_name_search_filters_parent_and_follows_pages(plugin_module, monkeypatch):
+    client = plugin_module.P123SyncClient('account', 'secret', page_interval=0)
+    calls = []
+    def checked(_name, _path, *, params):
+        calls.append(params)
+        if params['Page'] == 1:
+            return {'data': {'InfoList': [{'FileId':1,'FileName':'a','Type':0,'Size':3,'ParentFileId':99}], 'Next':'', 'Total':3}}
+        return {'data': {'InfoList': [{'FileId':2,'FileName':'a','Type':0,'Size':3,'ParentFileId':7},
+                                      {'FileId':3,'FileName':'a-folder','Type':0,'Size':3,'ParentFileId':7}], 'Next':-1, 'Total':3}}
+    monkeypatch.setattr(client, '_checked', checked)
+    assert [item.file_id for item in client.find_files_by_name(7, 'a')] == [2]
+    assert len(calls) == 2
 
 
 def test_client_retry_wait_is_cancellable(plugin_module, monkeypatch):
@@ -312,6 +383,58 @@ def test_queued_config_applies_only_after_clean_completion(plugin_module, tmp_pa
     assert plugin._apply_queued_if_safe()
     assert closed and applied[-1]['tasks'][0]['target_path'] == '/new'
     assert plugin.api_get_config()['passport'] == 'new' and not data
+
+
+def test_reverting_queued_settings_clears_queue_but_preserves_recovery(plugin_module, tmp_path):
+    plugin = plugin_module.P123Sync()
+    data = {}
+    plugin.save_data = lambda key, value: data.__setitem__(key, value)
+    plugin.get_data = lambda key: data.get(key)
+    plugin.del_data = lambda key: data.pop(key, None)
+    plugin.update_config = lambda config: pytest.fail('active config must not be rewritten')
+    pair = plugin_module.TaskPairConfig(id='p1', name='Test', source_path=str(tmp_path), target_path='/old')
+    plugin._pairs = [pair]
+    plugin._passport, plugin._password = 'old', 'secret'
+    active = plugin._active_config()
+    plugin._state.begin([pair])
+    plugin._state.add_files([{'key':'p1:a', 'pair_id':'p1', 'path':'a', 'size':1,
+                              'state':'pending', 'percent':0, 'speed':0, 'error':None}])
+    transfer = {'kind':'upload', 'target':'a', 'stage':'a'}
+    plugin._state.patch_file('p1:a', transfer=transfer)
+    plugin._state.mark_file('p1:a', 'failed', error='uncertain')
+    plugin._state.finish('finished')
+    plugin._queue_config({**active, 'verify_md5':True})
+    response = plugin.api_save_config(plugin_module.SaveConfigRequest(config=active))
+    assert response['success'] and not response.get('deferred')
+    assert plugin_module.PENDING_CONFIG_KEY not in data
+    assert not plugin.api_get_config().get('pending_config')
+    assert plugin._state.file_record('p1:a')['transfer'] == transfer
+    assert plugin._state.file_record('p1:a')['state'] == 'failed'
+
+
+def test_reverting_queue_reports_storage_failure(plugin_module):
+    plugin = plugin_module.P123Sync()
+    data = {}
+    plugin.save_data = lambda key, value: data.__setitem__(key, value)
+    plugin.get_data = lambda key: data.get(key)
+    plugin.del_data = lambda key: None
+    plugin._queue_config({**plugin._active_config(), 'verify_md5':True})
+    result = plugin.api_save_config(plugin_module.SaveConfigRequest(config=plugin._active_config()))
+    assert not result['success'] and '处理失败' in result['message']
+    assert plugin._queue_error and plugin._queued_config is not None
+
+
+def test_legacy_queued_settings_equal_to_active_are_cleared(plugin_module):
+    plugin = plugin_module.P123Sync()
+    data = {}
+    plugin.save_data = lambda key, value: data.__setitem__(key, value)
+    plugin.get_data = lambda key: data.get(key)
+    plugin.del_data = lambda key: data.pop(key, None)
+    legacy = plugin._active_config()
+    legacy.pop('verify_md5')
+    plugin._queue_config(legacy)
+    assert plugin._apply_queued_if_safe()
+    assert plugin._queued_config is None and not data
 
 
 def test_deferred_config_storage_failure_does_not_report_saved(plugin_module):
@@ -406,6 +529,7 @@ def test_plugin_worker_persists_and_restores_completed_sync(plugin_module, tmp_p
     class Cloud:
         def __init__(self): self.items = []; self.uploads = 0
         def list_dir(self, parent_id, cancel_check=None): return list(self.items)
+        def find_files_by_name(self, parent_id, name, cancel_check=None): return [x for x in self.items if x.name == name]
         def walk(self, parent_id, prefix='', cancel_check=None):
             for item in self.items: yield item.name, item
         def _file_md5(self, path, cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
@@ -455,12 +579,12 @@ def test_upload_put_http_failure_is_not_reported_as_success(plugin_module):
 def test_release_zip_contains_only_current_plugin_sources_and_assets(tmp_path):
     import subprocess, sys, zipfile
     root = Path(__file__).resolve().parents[3]
-    output = tmp_path / 'p123sync_v1.7.0.zip'
+    output = tmp_path / 'p123sync_v1.7.1.zip'
     subprocess.run([sys.executable, str(root / '.github/scripts/package_p123sync_release.py'), str(output)],
                    cwd=root, check=True, capture_output=True, text=True)
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
-        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_7_0/remoteEntry.js' in names
+        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_7_1/remoteEntry.js' in names
         assert all(not name.startswith(('dist/assets/', 'dist/v1_4_0/', 'dist/v1_5_0/', 'dist/v1_6_0/')) for name in names)
         assert not any('__pycache__' in name or name.endswith('.sqlite3') for name in names)
         assert archive.testzip() is None
@@ -522,6 +646,7 @@ def test_directory_monitor_waits_for_stability_and_acknowledges_exact_files(plug
     class Cloud:
         def __init__(self): self.items=[]; self.uploads=[]
         def list_dir(self, parent_id, cancel_check=None): return list(self.items)
+        def find_files_by_name(self, parent_id, name, cancel_check=None): return [x for x in self.items if x.name == name]
         def walk(self, parent_id, prefix='', cancel_check=None):
             for item in self.items: yield item.name,item
         def _file_md5(self, path, cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
@@ -585,6 +710,7 @@ def test_monitor_retries_lost_upload_response_after_backoff_without_duplicate(pl
     class Cloud:
         def __init__(self): self.items=[]; self.uploads=0
         def list_dir(self,parent_id,cancel_check=None): return list(self.items)
+        def find_files_by_name(self,parent_id,name,cancel_check=None): return [x for x in self.items if x.name==name]
         def walk(self,parent_id,prefix='',cancel_check=None):
             for item in self.items: yield item.name,item
         def _file_md5(self,path,cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
@@ -650,6 +776,7 @@ def test_downloader_monitor_queues_and_syncs_only_confirmed_completed_files(plug
     class Cloud:
         def __init__(self): self.items=[]; self.uploads=[]
         def list_dir(self,parent_id,cancel_check=None): return list(self.items)
+        def find_files_by_name(self,parent_id,name,cancel_check=None): return [x for x in self.items if x.name == name]
         def walk(self,parent_id,prefix='',cancel_check=None):
             for item in self.items: yield item.name,item
         def _file_md5(self,path,cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
@@ -785,6 +912,7 @@ def test_unexpected_worker_exit_is_durable_and_monitor_retry_reconciles(plugin_m
     class Cloud:
         def __init__(self): self.items=[]; self.uploads=0
         def list_dir(self,parent_id,cancel_check=None): return list(self.items)
+        def find_files_by_name(self,parent_id,name,cancel_check=None): return [x for x in self.items if x.name==name]
         def walk(self,parent_id,prefix='',cancel_check=None):
             for item in self.items: yield item.name,item
         def _file_md5(self,path,cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()

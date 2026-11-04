@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 import re
+import threading
 from hashlib import md5
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -30,6 +31,10 @@ PAGE_SIZE = 100
 # p123disk uses 1s between fs_list pages; keep the same conservative pacing to
 # avoid tripping 123 web-API rate limits during full-tree listings.
 PAGE_INTERVAL_SECONDS = 1.0
+# Directory trees can contain thousands of small folders, so pacing only
+# subsequent pages does not prevent bursts of first-page requests.
+LIST_REQUEST_INTERVAL_SECONDS = 0.2
+LIST_RATE_LIMIT_RETRIES = 5
 # MD5 is computed with 1MB reads instead of p123disk's 4KB reads.
 MD5_CHUNK_SIZE = 1024 * 1024
 UPLOAD_RETRIES = 6
@@ -39,6 +44,11 @@ UPLOAD_TIMEOUT_SECONDS = 300
 
 class P123ClientError(Exception):
     """Raised when a 123 API call fails."""
+
+    def __init__(self, message: str, *, service_code=None, operation=None):
+        super().__init__(message)
+        self.service_code = service_code
+        self.operation = operation
 
 
 class RemoteItem(dict):
@@ -128,6 +138,8 @@ class P123SyncClient:
         self.client = P123AutoClient(passport, password)
         self._logger = logger or (lambda _msg: None)
         self._page_interval = page_interval
+        self._list_lock = threading.Lock()
+        self._next_list_at = 0.0
 
     # ------------------------------------------------------------------ utils
 
@@ -144,7 +156,13 @@ class P123SyncClient:
         try:
             check_response(resp)
         except Exception as err:
-            raise P123ClientError(f"{name} 响应异常（{type(err).__name__}）") from err
+            # Response bodies can contain credentials, signed URLs or file
+            # details. Preserve only the numeric service code for diagnosis.
+            raw_code = resp.get("code") if isinstance(resp, dict) else None
+            code = str(raw_code) if isinstance(raw_code, (int, str)) and not isinstance(raw_code, bool) else ""
+            detail = f"，云盘错误码 {code}" if re.fullmatch(r"-?\d{1,10}", code) else ""
+            raise P123ClientError(f"{name} 响应异常（{type(err).__name__}{detail}）",
+                                  service_code=int(code) if detail else None, operation=name) from err
         return resp
 
     def user_info(self) -> Dict[str, Any]:
@@ -168,38 +186,86 @@ class P123SyncClient:
     # ----------------------------------------------------------------- listing
 
     def list_dir(self, parent_file_id: int, cancel_check: Optional[Callable[[], bool]] = None) -> List[RemoteItem]:
-        """List one directory (files + subdirs), following Next pagination."""
+        """List one directory using the page-based endpoint and its total."""
+        return self._list_new(parent_file_id, cancel_check=cancel_check)
+
+    def _list_request(self, payload: Dict, cancel_check: Optional[Callable[[], bool]] = None) -> Dict:
+        """Pace list calls across directories and back off on service throttling."""
+        for attempt in range(LIST_RATE_LIMIT_RETRIES + 1):
+            with self._list_lock:
+                self._wait(max(0.0, self._next_list_at - time.monotonic()), cancel_check)
+                if cancel_check and cancel_check():
+                    raise KeyboardInterrupt
+                self._next_list_at = time.monotonic() + LIST_REQUEST_INTERVAL_SECONDS
+                try:
+                    return self._checked("request", "file/list/new", params=payload)
+                except P123ClientError as err:
+                    if err.service_code not in (429, 100011) or attempt == LIST_RATE_LIMIT_RETRIES:
+                        raise
+            delay = min(2 ** (attempt + 1), 20)
+            self._log(f"云盘目录请求受限，{delay} 秒后重试")
+            self._wait(delay, cancel_check)
+        raise AssertionError("unreachable")
+
+    def _list_new(self, parent_file_id: int, search_name: Optional[str] = None,
+                  cancel_check: Optional[Callable[[], bool]] = None) -> List[RemoteItem]:
+        """Reject incomplete, repeated or changing pages instead of guessing."""
         items: List[RemoteItem] = []
+        seen_ids = set()
+        expected_total = None
         page = 1
-        next_flag = 0
-        seen_next = set()
         while True:
             if cancel_check and cancel_check():
                 raise KeyboardInterrupt
             payload = {
+                "driveId": 0,
                 "limit": PAGE_SIZE,
-                "next": next_flag,
                 "Page": page,
                 "parentFileId": int(parent_file_id),
-                "inDirectSpace": "false",
+                "inDirectSpace": False,
+                "orderBy": "file_id",
+                "orderDirection": "asc",
+                "trashed": False,
+                "fileCategory": 0,
+                "event": "homeListFile",
+                "OnlyLookAbnormalFile": 0,
             }
-            resp = self._checked("fs_list", payload)
+            if search_name is not None:
+                payload["SearchData"] = search_name
+            # The p123client fs_list_new wrapper lowercases query keys, while
+            # this endpoint requires camelCase (for example driveId). Send the
+            # documented keys directly through its authenticated request.
+            resp = self._list_request(payload, cancel_check)
             data = resp.get("data")
-            if not isinstance(data, dict) or "InfoList" not in data or "Next" not in data:
-                raise P123ClientError("云盘目录响应缺少列表或分页信息，无法确认列举完整")
-            info_list = data.get("InfoList") or []
-            if not isinstance(info_list, list):
-                raise P123ClientError("云盘目录响应格式异常，无法确认列举完整")
-            items.extend(RemoteItem(item) for item in info_list if item)
-            if str(data.get("Next")) == "-1":
-                break
-            if not info_list or data.get("Next") is None or str(data.get("Next")) in seen_next:
-                raise P123ClientError("云盘目录分页中断或重复，无法确认列举完整")
+            if not isinstance(data, dict) or not isinstance(data.get("InfoList"), list) or "Total" not in data:
+                raise P123ClientError("云盘目录响应缺少列表或总数，无法确认列举完整")
+            try:
+                total = int(data["Total"])
+                if total < 0:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise P123ClientError("云盘目录总数无效，无法确认列举完整") from None
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise P123ClientError("云盘目录在列举期间发生变化，请重试")
+            info_list = data["InfoList"]
+            for raw in info_list:
+                if not isinstance(raw, dict) or raw.get("FileId") is None:
+                    raise P123ClientError("云盘目录项目缺少标识，无法确认列举完整")
+                file_id = str(raw["FileId"])
+                if file_id in seen_ids:
+                    raise P123ClientError("云盘目录分页重复，无法确认列举完整")
+                seen_ids.add(file_id)
+                items.append(RemoteItem(raw))
+            if len(items) > total:
+                raise P123ClientError("云盘目录数量异常，无法确认列举完整")
+            if len(items) == total:
+                return items
+            if not info_list or str(data.get("Next")) == "-1":
+                raise P123ClientError("云盘目录分页中断，无法确认列举完整")
             page += 1
-            next_flag = data.get("Next")
-            seen_next.add(str(next_flag))
             self._wait(self._page_interval, cancel_check)
-        return items
 
     def walk(self, root_file_id: int, prefix: str = "",
              cancel_check: Optional[Callable[[], bool]] = None) -> Iterator[Tuple[str, RemoteItem]]:
@@ -215,6 +281,19 @@ class P123SyncClient:
                     stack.append((f"{rel_path}/", item.file_id))
                 else:
                     yield rel_path, item
+
+    def find_files_by_name(self, parent_file_id: int, name: str,
+                           cancel_check: Optional[Callable[[], bool]] = None) -> List[RemoteItem]:
+        """Search, then retain exact names in the requested parent only."""
+        matches: List[RemoteItem] = []
+        for item in self._list_new(parent_file_id, search_name=name, cancel_check=cancel_check):
+            try:
+                same_parent = int(item.get("ParentFileId")) == int(parent_file_id)
+            except (TypeError, ValueError):
+                same_parent = False
+            if same_parent and not item.is_dir and item.name == name:
+                matches.append(item)
+        return matches
 
     # -------------------------------------------------------------- operations
 

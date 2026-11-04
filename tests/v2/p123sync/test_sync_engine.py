@@ -78,6 +78,10 @@ class FakeClient:
     def list_dir(self, parent_file_id: int, cancel_check=None) -> list[FakeItem]:
         return self.remote.get(str(parent_file_id), [])
 
+    def find_files_by_name(self, parent_file_id, name, cancel_check=None):
+        return [item for item in self.list_dir(parent_file_id, cancel_check)
+                if not item.is_dir and item.name == name]
+
     def walk(self, root_file_id: int, prefix: str = "", cancel_check=None):
         def walk_dir(dir_id: str, rel: str):
             for item in self.remote.get(dir_id, []):
@@ -283,6 +287,41 @@ def test_engine_second_run_skips_same_size(local_tree):
     assert snap["bytes_skipped"] == 303
 
 
+def test_skips_are_checkpointed_in_batches_without_hashing(tmp_path):
+    src = tmp_path / 'src'; src.mkdir()
+    remote = {'0':[FakeItem(1,'test',1)], '1':[FakeItem(2,'target',1)], '2':[]}
+    for i in range(120):
+        name = f'{i:03}.txt'; (src / name).write_bytes(b'x')
+        remote['2'].append(FakeItem(1000+i, name, 0, 1))
+    class State(engine_mod.RunState):
+        def __init__(self): super().__init__(); self.batches=[]
+        def mark_skipped_batch(self, pair_id, keys):
+            self.batches.append(len(keys))
+            return super().mark_skipped_batch(pair_id, keys)
+    class Client(FakeClient):
+        def _file_md5(self, *args, **kwargs): raise AssertionError('unexpected MD5')
+    state=State()
+    engine_mod.SyncEngine(Client(remote), lambda _:None, threading.Event(), state).run([make_pair(tmp_path)])
+    snapshot=state.snapshot()
+    assert state.batches == [50,50,20]
+    assert snapshot['counters']['skipped'] == 120 and snapshot['counters']['failed'] == 0
+    assert snapshot['bytes_skipped'] == 120 and snapshot['pairs']['t1']['skipped'] == 120
+
+
+def test_failed_batch_checkpoint_restores_all_in_memory_state(local_tree, monkeypatch):
+    pair=make_pair(local_tree.parent)
+    state=engine_mod.RunState(); state.begin([pair])
+    state.add_files([{'key':f't1:{name}', 'pair_id':'t1', 'path':name, 'size':3,
+                      'state':'pending', 'percent':0, 'speed':0, 'error':None} for name in ('a','b')])
+    before=state.snapshot()
+    monkeypatch.setattr(state, '_checkpoint', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('disk full')))
+    with pytest.raises(OSError, match='disk full'):
+        state.mark_skipped_batch('t1', ['t1:a','t1:b'])
+    after=state.snapshot()
+    assert after['files'] == before['files'] and after['counters'] == before['counters']
+    assert after['bytes_skipped'] == before['bytes_skipped'] and after['pairs'] == before['pairs']
+
+
 def test_engine_overwrite_trashes_old(local_tree):
     client = FakeClient(remote=_populated_remote(a_size=99))
     pair = make_pair(local_tree.parent, policy=engine_mod.POLICY_SKIP_SAME_SIZE,
@@ -397,6 +436,86 @@ def test_retry_only_selected_failure_preserves_other_results(local_tree):
     assert client.trashed == [501]  # no successful or unselected files are overwritten
 
 
+@pytest.mark.parametrize('strict,remote_size,remote_digest,expect_skip', [
+    (False, 3, 'different', True),
+    (False, 4, None, False),
+    (True, 3, hashlib.md5(b'aaa').hexdigest(), True),
+    (True, 3, 'different', False),
+])
+def test_missing_listing_entry_is_reconciled_only_by_current_policy(local_tree, strict, remote_size, remote_digest, expect_skip):
+    class Conflict(Exception):
+        operation = 'upload_request'
+        service_code = 5060
+    class Cloud(FakeClient):
+        def upload(self, *args, **kwargs):
+            raise Conflict('duplicate')
+        def find_files_by_name(self, parent_id, name, cancel_check):
+            assert parent_id == 2 and name == 'a.txt'
+            return [FakeItem(503, name, 0, remote_size, remote_digest)]
+    remote = {'0':[FakeItem(1,'test',1)], '1':[FakeItem(2,'target',1)], '2':[]}
+    client = Cloud(remote)
+    pair = make_pair(local_tree.parent)
+    state = engine_mod.RunState()
+    state.begin([pair])
+    state.add_files([{'key':'t1:a.txt','pair_id':'t1','pair_name':'test','path':'a.txt',
+                      'size':3,'state':'pending','percent':0,'speed':0,'error':None}])
+    state.mark_file('t1:a.txt','failed',error='old failure')
+    state.patch_file('t1:a.txt', transfer={'kind':'upload','target':'a.txt','stage':'a.txt',
+                                           'backup':None,'stage_id':None,'size':3,
+                                           'md5':hashlib.md5(b'aaa').hexdigest()})
+    state.finish('finished')
+    state.begin_retry({'t1:a.txt'})
+    engine_mod.SyncEngine(client, lambda _:None, threading.Event(), state, verify_md5=strict).run(
+        [pair], retry_paths={'t1':{'a.txt'}}, already_started=True)
+    record = state.file_record('t1:a.txt')
+    assert record['state'] == ('skipped' if expect_skip else 'failed')
+    assert (record['transfer'] is None) == expect_skip
+    assert client.trashed == [] and not client.renames
+
+
+def test_pending_upload_size_recovery_does_not_hash_or_upload(local_tree):
+    class Cloud(FakeClient):
+        def find_files_by_name(self, parent_id, name, cancel_check=None):
+            return [FakeItem(503, name, 0, 3)]
+        def _file_md5(self, *args, **kwargs):
+            raise AssertionError('size-only recovery must not hash')
+        def upload(self, *args, **kwargs):
+            raise AssertionError('existing same-size file must not upload')
+    client = Cloud({'0':[FakeItem(1,'test',1)], '1':[FakeItem(2,'target',1)], '2':[]})
+    pair = make_pair(local_tree.parent)
+    state = engine_mod.RunState()
+    state.begin([pair])
+    state.add_files([{'key':'t1:a.txt','pair_id':'t1','path':'a.txt','size':3,
+                      'state':'pending','percent':0,'speed':0,'error':None}])
+    state.patch_file('t1:a.txt', transfer={'kind':'upload','target':'a.txt','stage':'a.txt','size':3})
+    state.mark_file('t1:a.txt','failed',error='old failure')
+    state.finish('finished')
+    state.begin_retry({'t1:a.txt'})
+    engine_mod.SyncEngine(client, lambda _:None, threading.Event(), state).run(
+        [pair], retry_paths={'t1':{'a.txt'}}, already_started=True)
+    assert state.file_record('t1:a.txt')['state'] == 'skipped'
+    assert state.file_record('t1:a.txt')['transfer'] is None
+
+
+def test_unlisted_same_size_file_is_found_before_hash_or_upload(local_tree):
+    class Cloud(FakeClient):
+        def find_files_by_name(self, parent_id, name, cancel_check=None):
+            return [FakeItem(503, name, 0, 3)] if name == 'a.txt' else []
+        def _file_md5(self, *args, **kwargs):
+            raise AssertionError('same-size file must not be hashed')
+        def upload(self, *args, **kwargs):
+            raise AssertionError('same-size file must not be uploaded')
+    client = Cloud({'0':[FakeItem(1,'test',1)], '1':[FakeItem(2,'target',1)], '2':[]})
+    pair = make_pair(local_tree.parent)
+    file = local_tree / 'a.txt'
+    stat = file.stat()
+    selected = {'t1': {'a.txt': {'size':stat.st_size, 'mtime_ns':stat.st_mtime_ns}}}
+    state = engine_mod.RunState()
+    engine_mod.SyncEngine(client, lambda _:None, threading.Event(), state).run([pair], selected_paths=selected)
+    assert state.file_record('t1:a.txt')['state'] == 'skipped'
+    assert state.snapshot()['counters']['failed'] == 0
+
+
 def test_retry_missing_source_stays_failed(local_tree):
     class FailingClient(FakeClient):
         def upload(self, *args, **kwargs):
@@ -434,10 +553,10 @@ def test_retry_listing_failure_preserves_retryable_records(local_tree):
         fail_listing = False
         def upload(self, *args, **kwargs):
             raise RuntimeError('upload failed')
-        def walk(self, *args, **kwargs):
+        def list_dir(self, *args, **kwargs):
             if self.fail_listing:
                 raise RuntimeError('listing unavailable')
-            yield from super().walk(*args, **kwargs)
+            return super().list_dir(*args, **kwargs)
     client = BrokenClient(remote=_populated_remote())
     pair = make_pair(local_tree.parent, policy=engine_mod.POLICY_OVERWRITE, exclude_ext=['.nfo'])
     state, _ = run_engine(client, [pair])
@@ -453,6 +572,47 @@ def test_retry_listing_failure_preserves_retryable_records(local_tree):
     assert snapshot['pairs']['t1']['failed'] == 3
     record = next(f for f in snapshot['files'] if f['key'] == 't1:a.txt')
     assert record['state'] == 'failed' and 'listing unavailable' in record['error']
+
+
+def test_retry_lists_only_the_selected_parent_directory(local_tree):
+    class TrackingClient(FakeClient):
+        def __init__(self, remote):
+            super().__init__(remote)
+            self.listed = []
+        def list_dir(self, parent_file_id, cancel_check=None):
+            self.listed.append(parent_file_id)
+            return super().list_dir(parent_file_id, cancel_check)
+        def walk(self, *args, **kwargs):
+            raise AssertionError('retry must not walk the whole cloud tree')
+    client = TrackingClient(_populated_remote())
+    pair = make_pair(local_tree.parent)
+    state = engine_mod.RunState()
+    state.begin([pair])
+    state.add_files([{'key':'t1:Season 1/e01.mkv', 'pair_id':'t1', 'path':'Season 1/e01.mkv',
+                      'size':1, 'state':'pending', 'percent':0, 'speed':0, 'error':None}])
+    state.mark_file('t1:Season 1/e01.mkv', 'failed', error='retry')
+    state.finish('finished')
+    state.begin_retry({'t1:Season 1/e01.mkv'})
+    engine_mod.SyncEngine(client, lambda _: None, threading.Event(), state).run(
+        [pair], retry_paths={'t1': {'Season 1/e01.mkv'}}, already_started=True)
+    assert state.snapshot()['counters']['failed'] == 0
+    assert 2 in client.listed  # target root
+    assert all(str(directory) in {'0', '1', '2', '500'} for directory in client.listed)
+
+
+def test_monitor_lists_only_selected_parent_directory(local_tree):
+    class Cloud(FakeClient):
+        def walk(self, *args, **kwargs):
+            raise AssertionError('monitor batch must not walk the whole cloud tree')
+    client = Cloud(_populated_remote())
+    pair = make_pair(local_tree.parent)
+    file = local_tree / 'Season 1' / 'e01.mkv'
+    stat = file.stat()
+    selected = {'t1': {'Season 1/e01.mkv': {'size':stat.st_size, 'mtime_ns':stat.st_mtime_ns}}}
+    state = engine_mod.RunState()
+    engine_mod.SyncEngine(client, lambda _:None, threading.Event(), state).run([pair], selected_paths=selected)
+    assert state.snapshot()['counters']['skipped'] == 1
+    assert state.snapshot()['counters']['failed'] == 0
 
 
 def test_retry_keeps_original_run_error_visible_and_cancelled_retry_is_retryable(local_tree):

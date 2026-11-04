@@ -96,7 +96,7 @@ class P123Sync(_PluginBase):
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录同步到123云盘：支持手动、目录监控及下载器监控，大小一致快速跳过、可选MD5严格校验、安全覆盖与中断恢复。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -254,6 +254,22 @@ class P123Sync(_PluginBase):
                     return False
             if not self._queued_config:
                 return False
+            # Saving the active settings again cancels a previous deferred edit.
+            # This is safe even with unresolved transfers: neither credentials nor
+            # the task definitions used to recover them are being changed.
+            active = self._active_config()
+            if all(self._queued_config.get(key, DEFAULT_CONFIG[key]) == active[key] for key in DEFAULT_CONFIG):
+                try:
+                    self.del_data(PENDING_CONFIG_KEY)
+                    if self.get_data(PENDING_CONFIG_KEY) is not None:
+                        raise RuntimeError("取消待生效设置持久化校验失败")
+                    self._queued_config = None
+                    self._queue_error = None
+                    return True
+                except Exception as err:
+                    self._queue_error = type(err).__name__
+                    logger.error(f"{LOG_PREFIX}取消待生效设置失败: {type(err).__name__}")
+                    return False
             snap = self._state.snapshot()
             if (snap['phase'] not in ('idle', PHASE_FINISHED) or snap.get('error') or
                     snap['counters'].get('failed') or snap['counters'].get('cancelled') or
@@ -468,7 +484,7 @@ class P123Sync(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
         """Vue federated frontend with a versioned asset directory."""
-        return "vue", "dist/v1_7_0"
+        return "vue", "dist/v1_7_1"
 
     def get_dashboard(self, key: str = "", user_agent: str = None) -> Tuple[dict, dict, None]:
         """Register the federated Dashboard with the MoviePilot host."""
@@ -660,6 +676,9 @@ class P123Sync(_PluginBase):
     def api_get_config(self) -> Dict[str, Any]:
         if self._queued_config:
             return {**self._queued_config, "pending_config": True}
+        return self._active_config()
+
+    def _active_config(self) -> Dict[str, Any]:
         return {
             "enabled": self._enabled,
             "passport": self._passport,
@@ -751,6 +770,8 @@ class P123Sync(_PluginBase):
                         return {"success": False, "message": "无法保存待生效配置，请检查插件数据存储"}
                     if claimed:
                         self._apply_queued_if_safe()
+                    if self._queue_error:
+                        return {"success": False, "message": "待生效设置处理失败，请检查插件数据存储"}
                     if self._queued_config:
                         return {"success": True, "deferred": True,
                                 "message": "设置已保存为待生效；当前同步及未解决的失败处理完成后自动应用"}

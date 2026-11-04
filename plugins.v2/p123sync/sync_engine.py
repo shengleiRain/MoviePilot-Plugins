@@ -526,6 +526,36 @@ class RunState:
             self.bytes_skipped += size
             self._checkpoint()
 
+    def mark_skipped_batch(self, pair_id: str, keys: List[str]):
+        """Commit verified skips and monitor acknowledgements in one transaction."""
+        if not keys:
+            return
+        with self._lock:
+            records = [self._file_index[key] for key in keys]
+            if any(record.get('state') != FILE_PENDING or record.get('transfer') for record in records):
+                raise RuntimeError('跳过文件状态已变化，请重新同步')
+            old_records = [dict(record) for record in records]
+            old_counters, old_bytes = dict(self.counters), self.bytes_skipped
+            pair = self.pairs.get(pair_id)
+            old_pair = dict(pair) if pair else None
+            try:
+                for record in records:
+                    self._transition(record, FILE_SKIPPED, 100.0, 0.0, None)
+                    self.bytes_skipped += record.get('size') or 0
+                if pair:
+                    pair['skipped'] = pair.get('skipped', 0) + len(records)
+                    pair['current'] = records[-1].get('path', '')
+                self._checkpoint(records)
+            except Exception:
+                for record, original in zip(records, old_records):
+                    record.clear()
+                    record.update(original)
+                self.counters, self.bytes_skipped = old_counters, old_bytes
+                if pair is not None:
+                    pair.clear()
+                    pair.update(old_pair)
+                raise
+
     def update_retry_file_size(self, key: str, size: int, mtime_ns: Optional[int] = None,
                                monitor_scope: Optional[str] = None):
         with self._lock:
@@ -754,11 +784,28 @@ class SyncEngine:
             return self._resolve_remote_dir(target_root)
         return self._resolve_remote_dir(f"{target_root.rstrip('/')}/{rel_dir}")
 
-    def _build_remote_map(self, pair: TaskPairConfig) -> Dict[str, Dict]:
+    def _build_remote_map(self, pair: TaskPairConfig, retry_paths: Optional[set] = None) -> Dict[str, Dict]:
         root_id = self._resolve_remote_dir(pair.target_path, create=True)
         remote_map: Dict[str, Dict] = {}
         listed = 0
-        for rel_path, item in self.client.walk(root_id, cancel_check=self._cancelled):
+
+        def entries():
+            if retry_paths is None:
+                yield from self.client.walk(root_id, cancel_check=self._cancelled)
+                return
+            # A retry needs all names in each selected parent directory (for
+            # duplicate detection and keep-both naming), not the entire tree.
+            for rel_dir in sorted({str(PurePosixPath(path).parent) for path in retry_paths}):
+                try:
+                    directory = (root_id if rel_dir in ('', '.') else
+                                 self._resolve_remote_dir(f"{pair.target_path.rstrip('/')}/{rel_dir}", create=False))
+                except FileNotFoundError:
+                    continue
+                for item in self.client.list_dir(directory, cancel_check=self._cancelled):
+                    if not item.is_dir:
+                        yield join_rel(rel_dir, item.name), item
+
+        for rel_path, item in entries():
             listed += 1
             if listed % 200 == 0:
                 self.state.pair_update(
@@ -845,7 +892,9 @@ class SyncEngine:
 
         self.state.set_phase(PHASE_LISTING, pair.name)
         self.state.pair_update(pair.id, phase=PHASE_LISTING, current=pair.target_path)
-        remote_map = self._build_remote_map(pair)
+        selected_remote_paths = retry_paths if retry_paths is not None else (
+            set(selected_paths) if selected_paths is not None else None)
+        remote_map = self._build_remote_map(pair, selected_remote_paths)
         self.log(f"[{pair.name}] 远端列举完成: {len(remote_map)} 个文件")
 
         if self._verify_md5:
@@ -890,32 +939,65 @@ class SyncEngine:
                                       len(selected_paths) if selected_paths is not None else len(actions)),
                                current="")
 
+        skipped_batch: List[str] = []
+
+        def flush_skips():
+            nonlocal skipped
+            if skipped_batch:
+                self.state.mark_skipped_batch(pair.id, skipped_batch)
+                skipped += len(skipped_batch)
+                skipped_batch.clear()
+
         for action in actions:
             if self._cancelled():
                 break
             key = f"{pair.id}:{action.local.rel_path}"
+            pending_transfer = self.state.file_record(key).get("transfer")
+            if not pending_transfer and action.kind == 'skip':
+                try:
+                    self._confirm_unchanged(action.local)
+                except KeyboardInterrupt:
+                    flush_skips()
+                    raise
+                except Exception as err:
+                    flush_skips()
+                    failed += 1
+                    self.state.mark_file(key, FILE_FAILED, error=str(err))
+                    self.state.pair_update(pair.id, failed=failed, current=action.local.rel_path)
+                    self.log(f"[{pair.name}] 失败 {action.local.rel_path}: {err}")
+                else:
+                    skipped_batch.append(key)
+                    if len(skipped_batch) >= 50:
+                        flush_skips()
+                continue
+            flush_skips()
             self.state.pair_update(pair.id, current=action.local.rel_path)
             try:
-                pending_transfer = self.state.file_record(key).get("transfer")
                 if pending_transfer:
-                    self._execute_action(pair, action, key, remote_map)
-                    if action.instant:
+                    result = self._recover_size_only_upload(pair, action.local, key, pending_transfer)
+                    if result != FILE_SKIPPED:
+                        result = self._execute_action(pair, action, key, remote_map)
+                    if result == FILE_SKIPPED:
+                        skipped += 1
+                        self.state.pair_update(pair.id, skipped=skipped)
+                    elif action.instant:
                         instant += 1
                         self.state.pair_update(pair.id, instant=instant)
                     else:
                         done += 1
                         self.state.pair_update(pair.id, done=done)
-                elif action.kind == "skip":
-                    self._confirm_unchanged(action.local)
-                    skipped += 1
-                    self.state.mark_file(key, FILE_SKIPPED, percent=100.0)
-                    self.state.add_skipped_bytes(action.local.size)
-                    self.state.pair_update(pair.id, skipped=skipped)
                 elif action.kind in ("unverified", "conflict"):
                     raise RuntimeError(action.error)
                 else:
-                    self._execute_action(pair, action, key, remote_map)
-                    if action.instant:
+                    result = (self._recover_size_only_upload(pair, action.local, key,
+                              {'kind': 'upload', 'target': action.local.abs_path.name})
+                              if action.kind == 'upload' else None)
+                    if result != FILE_SKIPPED:
+                        result = self._execute_action(pair, action, key, remote_map)
+                    if result == FILE_SKIPPED:
+                        skipped += 1
+                        self.state.pair_update(pair.id, skipped=skipped)
+                    elif action.instant:
                         instant += 1
                         self.state.pair_update(pair.id, instant=instant)
                     else:
@@ -928,7 +1010,28 @@ class SyncEngine:
                 self.state.mark_file(key, FILE_FAILED, error=str(err))
                 self.state.pair_update(pair.id, failed=failed)
                 self.log(f"[{pair.name}] 失败 {action.local.rel_path}: {err}")
+        flush_skips()
         self.state.pair_update(pair.id, phase=PHASE_FINISHED, current="")
+
+    def _recover_size_only_upload(self, pair: TaskPairConfig, local: LocalFile,
+                                  key: str, transfer: Dict):
+        """Resolve omitted existing files by exact parent/name and size."""
+        if (self._verify_md5 or pair.policy != POLICY_SKIP_SAME_SIZE or
+                transfer.get('kind') != 'upload' or transfer.get('target') != local.abs_path.name):
+            return None
+        rel_dir = str(PurePosixPath(local.rel_path).parent)
+        remote_dir = pair.target_path if rel_dir in ('', '.') else f"{pair.target_path.rstrip('/')}/{rel_dir}"
+        try:
+            parent_id = self._resolve_remote_dir(remote_dir, create=False)
+        except FileNotFoundError:
+            return None
+        matches = self.client.find_files_by_name(parent_id, transfer['target'], self._cancelled)
+        if not any(item.size == local.size for item in matches):
+            return None
+        self._confirm_unchanged(local)
+        self.state.mark_file(key, FILE_SKIPPED, percent=100.0, clear_transfer=True)
+        self.state.add_skipped_bytes(local.size)
+        return FILE_SKIPPED
 
     def _verify_hashes(self, pair: TaskPairConfig, files: List[LocalFile]):
         """Hash pending files (optionally in parallel) with visible progress."""
@@ -1131,9 +1234,27 @@ class SyncEngine:
                     last_time[0] = now
                     last_bytes[0] = sent
 
-                file_id, action.instant = self.client.upload(
-                    local.abs_path, parent_id, stage, on_progress=on_progress,
-                    cancel_check=self._cancelled, file_md5=digest)
+                try:
+                    file_id, action.instant = self.client.upload(
+                        local.abs_path, parent_id, stage, on_progress=on_progress,
+                        cancel_check=self._cancelled, file_md5=digest)
+                except Exception as err:
+                    if (getattr(err, 'service_code', None) != 5060 or
+                            getattr(err, 'operation', None) != 'upload_request' or
+                            transfer['kind'] != 'upload' or pair.policy != POLICY_SKIP_SAME_SIZE):
+                        raise
+                    # The service can omit moved files from directory pagination
+                    # yet report them as duplicates on upload. Search is global,
+                    # so the client verifies the exact parent and filename.
+                    matches = self.client.find_files_by_name(parent_id, target, self._cancelled)
+                    matched = any(item.size == local.size and
+                                  (not self._verify_md5 or item.md5 == digest) for item in matches)
+                    if not matched:
+                        raise RuntimeError("云盘报告同名冲突，但无法确认目标目录中有符合当前策略的文件") from err
+                    self._confirm_unchanged(local)
+                    self.state.mark_file(key, FILE_SKIPPED, percent=100.0, clear_transfer=True)
+                    self.state.add_skipped_bytes(local.size)
+                    return FILE_SKIPPED
                 transfer['stage_id'] = file_id
                 self.state.patch_file(key, transfer=transfer)
                 stage_item = self._find_name(self.client.list_dir(parent_id, cancel_check=self._cancelled), stage)
