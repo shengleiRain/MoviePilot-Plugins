@@ -733,6 +733,7 @@ class _HashPrefetcher:
             self._executor = ThreadPoolExecutor(
                 max_workers=min(engine.VERIFY_THREADS, len(targets)),
                 thread_name_prefix="p123sync-prefetch")
+            engine.log(f"MD5 预读流水线已启用: {len(targets)} 个待传文件将后台并行预计算")
 
     def advance(self, local: "LocalFile") -> None:
         """Keep hashing underway for the files after the executing action."""
