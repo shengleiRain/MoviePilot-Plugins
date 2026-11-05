@@ -96,7 +96,7 @@ class P123Sync(_PluginBase):
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录同步到123云盘：支持手动、目录监控及下载器监控，大小一致快速跳过、可选MD5严格校验、安全覆盖与中断恢复。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -484,7 +484,7 @@ class P123Sync(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
         """Vue federated frontend with a versioned asset directory."""
-        return "vue", "dist/v1_7_1"
+        return "vue", "dist/v1_7_2"
 
     def get_dashboard(self, key: str = "", user_agent: str = None) -> Tuple[dict, dict, None]:
         """Register the federated Dashboard with the MoviePilot host."""

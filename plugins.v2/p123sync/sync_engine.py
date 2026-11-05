@@ -17,7 +17,7 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
@@ -39,12 +39,13 @@ TRIGGER_MODES = (TRIGGER_MANUAL, TRIGGER_DIRECTORY, TRIGGER_DOWNLOADER)
 PHASE_IDLE = "idle"
 PHASE_SCANNING = "scanning"
 PHASE_LISTING = "listing"
+PHASE_VERIFYING = "verifying"
 PHASE_UPLOADING = "uploading"
 PHASE_FINISHED = "finished"
 PHASE_CANCELLED = "cancelled"
 PHASE_ERROR = "error"
 
-RUNNING_PHASES = (PHASE_SCANNING, PHASE_LISTING, PHASE_UPLOADING)
+RUNNING_PHASES = (PHASE_SCANNING, PHASE_LISTING, PHASE_VERIFYING, PHASE_UPLOADING)
 
 # file states (counter keys match these names)
 FILE_PENDING = "pending"
@@ -316,6 +317,8 @@ class RunState:
         self._speed_window: List[Tuple[float, int]] = []
         self._retry_prior_error: Optional[str] = None
         self._interrupted_recoverable = False
+        # Live-only detail; transfer checkpoints remain the recovery source.
+        self._activity: Optional[Dict] = None
 
     def _checkpoint(self, records=(), replace=False):
         """Called with the state lock held; failures stop the sync safely."""
@@ -376,6 +379,7 @@ class RunState:
 
     def begin(self, pairs: List[TaskPairConfig]):
         with self._lock:
+            self._activity = None
             self.phase = PHASE_SCANNING
             self.started_at = time.time()
             self.finished_at = None
@@ -417,6 +421,30 @@ class RunState:
                 pair.update(kwargs)
                 self._checkpoint()
 
+    def set_activity(self, pair_id: str, path: str, stage: str, *, total_bytes: int = 0,
+                     completed_files: Optional[int] = None, total_files: Optional[int] = None):
+        """Publish the current stage without writing progress ticks to disk."""
+        with self._lock:
+            key = f"{pair_id}:{path}" if path else None
+            if not self._activity or (self._activity.get('key'), self._activity.get('stage')) != (key, stage):
+                self._activity = {'pair_id': pair_id, 'key': key, 'path': path, 'stage': stage,
+                                  'started_at': time.time(), 'processed_bytes': 0,
+                                  'total_bytes': total_bytes}
+            if completed_files is not None:
+                self._activity['completed_files'] = completed_files
+            if total_files is not None:
+                self._activity['total_files'] = total_files
+
+    def update_activity_bytes(self, pair_id: str, path: str, stage: str, processed: int):
+        with self._lock:
+            if self._activity and self._activity.get('key') == f"{pair_id}:{path}" and self._activity.get('stage') == stage:
+                total = self._activity.get('total_bytes') or 0
+                self._activity['processed_bytes'] = max(0, min(processed, total)) if total else max(0, processed)
+
+    def clear_activity(self):
+        with self._lock:
+            self._activity = None
+
     def add_files(self, records: List[Dict]):
         with self._lock:
             for record in records:
@@ -431,6 +459,7 @@ class RunState:
     def begin_retry(self, keys: Iterable[str]):
         """Requeue only selected failures while retaining the other records."""
         with self._lock:
+            self._activity = None
             self._retry_prior_error = self.error if self.phase in (PHASE_ERROR, PHASE_CANCELLED) else None
             self.run_id = uuid.uuid4().hex[:12]
             self.trigger = "retry"
@@ -582,6 +611,7 @@ class RunState:
 
     def finish(self, phase: str, error: Optional[str] = None):
         with self._lock:
+            self._activity = None
             if (phase == PHASE_FINISHED and self._interrupted_recoverable and
                     all(p.get('phase') == PHASE_FINISHED for p in self.pairs.values()) and
                     not any(self.counters.get(k) for k in (FILE_PENDING, FILE_UPLOADING, FILE_FAILED, FILE_CANCELLED))):
@@ -623,6 +653,9 @@ class RunState:
         window = [(ts, size) for ts, size in self._speed_window if now - ts <= 10]
         speed = sum(size for _, size in window) / max(now - window[0][0], 1.0) if window else 0.0
         eta = remaining / speed if speed > 0 else None
+        activity = dict(self._activity) if self._activity and self.phase in RUNNING_PHASES else None
+        if activity:
+            activity['elapsed'] = round(max(0.0, now - activity['started_at']), 1)
         return {
                 "run_id": self.run_id,
                 "trigger": self.trigger,
@@ -640,6 +673,7 @@ class RunState:
                 "eta": round(eta, 1) if eta else None,
                 "error": self.error,
                 "running": self.phase in RUNNING_PHASES,
+                "activity": activity,
                 "_retry_prior_error": self._retry_prior_error,
                 "_interrupted_recoverable": self._interrupted_recoverable,
                 "pairs": {pid: dict(pair) for pid, pair in self.pairs.items()},
@@ -651,7 +685,8 @@ class RunState:
             page = max(1, page)
             page_size = max(1, min(page_size, 100))
             items = [f for f in self.files if not active_only or
-                     f.get("state") in (FILE_UPLOADING, FILE_FAILED, FILE_CANCELLED)]
+                     f.get("state") in (FILE_UPLOADING, FILE_FAILED, FILE_CANCELLED) or
+                     (self._activity and f.get('key') == self._activity.get('key'))]
             total = len(items)
             pages = max(1, (total + page_size - 1) // page_size)
             page = min(page, pages)
@@ -672,6 +707,69 @@ class RunState:
 
 
 # ------------------------------------------------------------------ engine
+
+class _HashPrefetcher:
+    """Overlaps MD5 hashing of upcoming uploads with the current upload.
+
+    The instant-upload protocol needs the full digest before upload_request,
+    so without this the per-file stages run strictly serialized: hash A,
+    upload A, hash B, upload B. Background workers hash the next files while
+    the network is busy; the executing thread then finds the digest already
+    on the LocalFile, or waits for the in-flight future instead of re-reading.
+    """
+
+    LOOKAHEAD = 6   # files hashed ahead of the action being executed
+
+    def __init__(self, engine: "SyncEngine", actions: List["SyncAction"]):
+        self._engine = engine
+        targets = [action.local for action in actions
+                   if action.kind in ("upload", "overwrite") and action.local.md5 is None]
+        self._targets: List["LocalFile"] = targets
+        self._positions = {id(local): index for index, local in enumerate(targets)}
+        self._futures: Dict[int, Future] = {}
+        self._next = 0
+        self._executor: Optional[ThreadPoolExecutor] = None
+        if targets and engine.VERIFY_THREADS > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=min(engine.VERIFY_THREADS, len(targets)),
+                thread_name_prefix="p123sync-prefetch")
+
+    def advance(self, local: "LocalFile") -> None:
+        """Keep hashing underway for the files after the executing action."""
+        if not self._executor:
+            return
+        position = self._positions.get(id(local))
+        if position is None:
+            return
+        limit = min(position + 1 + self.LOOKAHEAD, len(self._targets))
+        while self._next < limit:
+            target = self._targets[self._next]
+            self._next += 1
+            if target.md5 is None:
+                self._futures[id(target)] = self._executor.submit(self._hash, target)
+
+    def await_hash(self, local: "LocalFile") -> Optional[str]:
+        """Block until a background hash of ``local`` finishes, if one exists."""
+        future = self._futures.pop(id(local), None)
+        if future is None:
+            return None
+        try:
+            future.result()
+        except BaseException:  # noqa: BLE001 - re-raised by the inline hash below
+            pass
+        return local.md5
+
+    def _hash(self, local: "LocalFile") -> None:
+        try:
+            self._engine._hash_source(local, allow_wait=False)
+        except BaseException:  # noqa: BLE001 - the executing thread re-runs and records it
+            pass
+
+    def close(self) -> None:
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+
 
 class SyncEngine:
     """Executes one sync run for a list of pairs against one client."""
@@ -701,6 +799,7 @@ class SyncEngine:
         self._monitor_scopes = monitor_scopes or {}
         self._journal = journal
         self._verify_md5 = verify_md5
+        self._prefetcher: Optional[_HashPrefetcher] = None
 
     # ---------------------------------------------------------------- public
 
@@ -728,6 +827,10 @@ class SyncEngine:
                     failed_pairs.append(f"{pair.name}: {err}")
                     self.state.pair_update(pair.id, phase=PHASE_ERROR, current=str(err))
                     self.log(f"[{pair.name}] 任务对失败: {err}")
+                finally:
+                    if self._prefetcher is not None:
+                        self._prefetcher.close()
+                        self._prefetcher = None
             if self.cancel_event.is_set():
                 self.state.finish(PHASE_CANCELLED)
                 self.log("同步已取消")
@@ -914,7 +1017,10 @@ class SyncEngine:
                 if (pair.policy != POLICY_OVERWRITE and remote and remote.get("size") == local.size
                         and remote.get("md5")):
                     to_verify.append(local)
-            self._verify_hashes(pair, to_verify)
+            if to_verify:
+                self.state.set_phase(PHASE_VERIFYING, pair.name)
+                self.state.pair_update(pair.id, phase=PHASE_VERIFYING)
+                self._verify_hashes(pair, to_verify)
 
         actions = plan_sync(local_files, remote_map, pair.policy, self._verify_md5)
         if retry_paths is None:
@@ -934,6 +1040,7 @@ class SyncEngine:
                 }
                 for action in actions
             ])
+        self.state.set_phase(PHASE_UPLOADING, pair.name)
         self.state.pair_update(pair.id, phase=PHASE_UPLOADING,
                                total=(previous.get("total", 0) if retry_paths is not None else
                                       len(selected_paths) if selected_paths is not None else len(actions)),
@@ -948,9 +1055,15 @@ class SyncEngine:
                 skipped += len(skipped_batch)
                 skipped_batch.clear()
 
+        # Hash upcoming upload files in background threads while the current
+        # file uploads: MD5 and network transfer no longer run serialized.
+        prefetcher = _HashPrefetcher(self, actions)
+        self._prefetcher = prefetcher
+
         for action in actions:
             if self._cancelled():
                 break
+            prefetcher.advance(action.local)
             key = f"{pair.id}:{action.local.rel_path}"
             pending_transfer = self.state.file_record(key).get("transfer")
             if not pending_transfer and action.kind == 'skip':
@@ -972,6 +1085,7 @@ class SyncEngine:
                 continue
             flush_skips()
             self.state.pair_update(pair.id, current=action.local.rel_path)
+            self.state.set_activity(pair.id, action.local.rel_path, 'checking_existing')
             try:
                 if pending_transfer:
                     result = self._recover_size_only_upload(pair, action.local, key, pending_transfer)
@@ -1010,7 +1124,11 @@ class SyncEngine:
                 self.state.mark_file(key, FILE_FAILED, error=str(err))
                 self.state.pair_update(pair.id, failed=failed)
                 self.log(f"[{pair.name}] 失败 {action.local.rel_path}: {err}")
+            finally:
+                self.state.clear_activity()
         flush_skips()
+        prefetcher.close()
+        self._prefetcher = None
         self.state.pair_update(pair.id, phase=PHASE_FINISHED, current="")
 
     def _recover_size_only_upload(self, pair: TaskPairConfig, local: LocalFile,
@@ -1038,10 +1156,15 @@ class SyncEngine:
         total = len(files)
         if not total:
             return
+        self.state.set_activity(pair.id, '', 'strict_verification', completed_files=0, total_files=total)
         if total == 1 or self.VERIFY_THREADS <= 1:
-            for index, local in enumerate(files, 1):
-                self.state.pair_update(pair.id, current=f"校验 {index}/{total} {local.rel_path}")
-                self._hash_source(local)
+            try:
+                for index, local in enumerate(files, 1):
+                    self.state.pair_update(pair.id, current=f"校验 {index}/{total} {local.rel_path}")
+                    self._hash_source(local)
+                    self.state.set_activity(pair.id, '', 'strict_verification', completed_files=index, total_files=total)
+            finally:
+                self.state.clear_activity()
             return
         done = 0
         first_error: Optional[BaseException] = None
@@ -1061,12 +1184,14 @@ class SyncEngine:
                     continue
                 done += 1
                 self.state.pair_update(pair.id, current=f"校验 {done}/{total} {local.rel_path}")
+                self.state.set_activity(pair.id, '', 'strict_verification', completed_files=done, total_files=total)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+            self.state.clear_activity()
         if first_error is not None:
             raise first_error
 
-    def _hash_source(self, local: LocalFile) -> str:
+    def _hash_source(self, local: LocalFile, on_start=None, on_progress=None, allow_wait: bool = True) -> str:
         if self._cancelled():
             raise KeyboardInterrupt
         before = local.abs_path.stat()
@@ -1080,8 +1205,20 @@ class SyncEngine:
                 digest = self._journal.md5_lookup(str(local.abs_path), local.size, local.mtime_ns)
             except Exception:
                 digest = None
+        if digest is None and allow_wait and self._prefetcher is not None:
+            # A background worker may still be hashing this file; waiting on
+            # its future beats reading the file a second time in parallel.
+            digest = self._prefetcher.await_hash(local)
         if digest is None:
-            digest = self.client._file_md5(local.abs_path, self._cancelled)
+            if on_start:
+                on_start()
+            started = time.monotonic()
+            self.log(f"开始计算 MD5: {local.rel_path} ({local.size / 1024 ** 2:.1f} MB)")
+            if on_progress:
+                digest = self.client._file_md5(local.abs_path, self._cancelled, on_progress=on_progress)
+            else:
+                digest = self.client._file_md5(local.abs_path, self._cancelled)
+            self.log(f"MD5 计算完成: {local.rel_path}，耗时 {time.monotonic() - started:.1f} 秒")
             if self._journal is not None and local.mtime_ns is not None:
                 try:
                     self._journal.md5_store(str(local.abs_path), local.size, local.mtime_ns, digest)
@@ -1166,7 +1303,12 @@ class SyncEngine:
         local = action.local
         rel_dir = str(PurePosixPath(local.rel_path).parent)
         parent_id = self._ensure_remote_dir(pair.target_path, rel_dir)
-        digest = self._hash_source(local)
+        digest = self._hash_source(
+            local,
+            on_start=lambda: self.state.set_activity(pair.id, local.rel_path, 'hashing', total_bytes=local.size),
+            on_progress=lambda value: self.state.update_activity_bytes(pair.id, local.rel_path, 'hashing', value),
+        )
+        self.state.set_activity(pair.id, local.rel_path, 'checking_remote')
         transfer = self.state.file_record(key).get("transfer")
         if transfer:
             transfer = dict(transfer)
@@ -1231,13 +1373,20 @@ class SyncEngine:
                     delta_time = max(now - last_time[0], 1e-6)
                     self.state.mark_file(key, FILE_UPLOADING, percent=percent,
                                          speed=delta_bytes / delta_time, transfer_delta=delta_bytes)
+                    self.state.update_activity_bytes(pair.id, local.rel_path, 'uploading', sent)
                     last_time[0] = now
                     last_bytes[0] = sent
+
+                def on_stage(stage: str):
+                    self.state.set_activity(pair.id, local.rel_path, stage,
+                                            total_bytes=local.size if stage == 'uploading' else 0)
+                    if stage == 'uploading':
+                        self.state.update_activity_bytes(pair.id, local.rel_path, stage, last_bytes[0])
 
                 try:
                     file_id, action.instant = self.client.upload(
                         local.abs_path, parent_id, stage, on_progress=on_progress,
-                        cancel_check=self._cancelled, file_md5=digest)
+                        cancel_check=self._cancelled, file_md5=digest, on_stage=on_stage)
                 except Exception as err:
                     if (getattr(err, 'service_code', None) != 5060 or
                             getattr(err, 'operation', None) != 'upload_request' or
@@ -1257,6 +1406,7 @@ class SyncEngine:
                     return FILE_SKIPPED
                 transfer['stage_id'] = file_id
                 self.state.patch_file(key, transfer=transfer)
+                self.state.set_activity(pair.id, local.rel_path, 'checking_remote')
                 stage_item = self._find_name(self.client.list_dir(parent_id, cancel_check=self._cancelled), stage)
                 if not self._matches(stage_item, digest, local.size, file_id):
                     raise RuntimeError(f"上传结果尚未通过云盘校验，已保留临时文件: {stage}")
@@ -1267,6 +1417,7 @@ class SyncEngine:
             self._hash_source(local)
 
         if transfer["kind"] == "overwrite":
+            self.state.set_activity(pair.id, local.rel_path, 'replacing')
             items = self.client.list_dir(parent_id, cancel_check=self._cancelled)
             target_item = self._find_name(items, target)
             backup_item = self._find_name(items, backup)

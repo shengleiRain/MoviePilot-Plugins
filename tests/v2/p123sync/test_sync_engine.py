@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import threading
 import hashlib
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,14 +117,20 @@ class FakeClient:
                 return
         raise RuntimeError('not found')
 
-    def _file_md5(self, path, cancel_check=None):
+    def _file_md5(self, path, cancel_check=None, on_progress=None):
         if cancel_check and cancel_check():
             raise KeyboardInterrupt
-        return hashlib.md5(path.read_bytes()).hexdigest()
+        data = path.read_bytes()
+        if on_progress:
+            on_progress(len(data))
+        return hashlib.md5(data).hexdigest()
 
     def upload(self, local_path: Path, parent_file_id: int, name: str,
-               on_progress=None, cancel_check=None, file_md5=None):
+               on_progress=None, cancel_check=None, file_md5=None, on_stage=None):
         size = local_path.stat().st_size
+        if on_stage:
+            on_stage('checking_instant')
+            on_stage('uploading')
         if on_progress:
             on_progress(50.0)
             on_progress(100.0)
@@ -142,9 +149,9 @@ class CountingClient(FakeClient):
         super().__init__(remote)
         self.hash_calls = 0
 
-    def _file_md5(self, path, cancel_check=None):
+    def _file_md5(self, path, cancel_check=None, on_progress=None):
         self.hash_calls += 1
-        return super()._file_md5(path, cancel_check)
+        return super()._file_md5(path, cancel_check, on_progress)
 
 
 def make_pair(tmp_path: Path, **overrides) -> "engine_mod.TaskPairConfig":
@@ -349,11 +356,11 @@ def test_engine_keep_both_renames(local_tree):
 def test_engine_failure_isolated_per_file(local_tree):
     class FailingClient(FakeClient):
         def upload(self, local_path, parent_file_id, name, on_progress=None,
-                   cancel_check=None, file_md5=None):
+                   cancel_check=None, file_md5=None, on_stage=None):
             if local_path.name.endswith("e01.mkv"):
                 raise RuntimeError("boom")
             return super().upload(local_path, parent_file_id, name, on_progress,
-                                  cancel_check, file_md5)
+                                  cancel_check, file_md5, on_stage)
 
     client = FailingClient(remote={"0": [FakeItem(1, "test", 1)]})
     pair = make_pair(local_tree.parent, exclude_ext=[".nfo"])
@@ -370,9 +377,9 @@ def test_engine_cancel_between_files(local_tree):
 
     class CancelClient(FakeClient):
         def upload(self, local_path, parent_file_id, name, on_progress=None,
-                   cancel_check=None, file_md5=None):
+                   cancel_check=None, file_md5=None, on_stage=None):
             result = super().upload(local_path, parent_file_id, name,
-                                    on_progress, cancel_check, file_md5)
+                                    on_progress, cancel_check, file_md5, on_stage)
             cancel_event.set()   # cancel right after the first upload
             return result
 
@@ -410,10 +417,10 @@ def test_run_state_counter_transitions():
 def test_retry_only_selected_failure_preserves_other_results(local_tree):
     class RetryClient(FakeClient):
         failing = {'e01.mkv', 'e02.mkv'}
-        def upload(self, local_path, parent_file_id, name, on_progress=None, cancel_check=None, file_md5=None):
+        def upload(self, local_path, parent_file_id, name, on_progress=None, cancel_check=None, file_md5=None, on_stage=None):
             if local_path.name in self.failing:
                 raise RuntimeError('temporary error')
-            return super().upload(local_path, parent_file_id, name, on_progress, cancel_check, file_md5)
+            return super().upload(local_path, parent_file_id, name, on_progress, cancel_check, file_md5, on_stage)
 
     client = RetryClient(remote=_populated_remote())
     pair = make_pair(local_tree.parent, policy=engine_mod.POLICY_OVERWRITE, exclude_ext=['.nfo'])
@@ -514,6 +521,57 @@ def test_unlisted_same_size_file_is_found_before_hash_or_upload(local_tree):
     engine_mod.SyncEngine(client, lambda _:None, threading.Event(), state).run([pair], selected_paths=selected)
     assert state.file_record('t1:a.txt')['state'] == 'skipped'
     assert state.snapshot()['counters']['failed'] == 0
+
+
+def test_live_hash_activity_shows_pending_file_and_clears_after_completion(tmp_path):
+    source = tmp_path / 'src'; source.mkdir(); (source / 'movie.mkv').write_bytes(b'abcdef')
+    hash_started, finish_hash = threading.Event(), threading.Event()
+    class Cloud(FakeClient):
+        def _file_md5(self, path, cancel_check=None, on_progress=None):
+            on_progress(2)
+            hash_started.set()
+            assert finish_hash.wait(5)
+            on_progress(6)
+            return hashlib.md5(path.read_bytes()).hexdigest()
+    class State(engine_mod.RunState):
+        def __init__(self): super().__init__(); self.stages=[]
+        def set_activity(self, pair_id, path, stage, **kwargs):
+            self.stages.append(stage)
+            super().set_activity(pair_id, path, stage, **kwargs)
+    state = State(); client = Cloud({'0':[FakeItem(1,'test',1)], '1':[FakeItem(2,'target',1)], '2':[]})
+    worker = threading.Thread(target=lambda: engine_mod.SyncEngine(client, lambda _:None, threading.Event(), state).run([make_pair(tmp_path)]))
+    worker.start()
+    try:
+        assert hash_started.wait(5)
+        snapshot = state.snapshot(include_files=False)
+        assert snapshot['phase'] == 'uploading'
+        assert snapshot['activity']['stage'] == 'hashing'
+        assert snapshot['activity']['path'] == 'movie.mkv'
+        assert snapshot['activity']['processed_bytes'] == 2 and snapshot['activity']['total_bytes'] == 6
+        assert state.files_page(active_only=True)['items'][0]['path'] == 'movie.mkv'
+    finally:
+        finish_hash.set(); worker.join(5)
+    assert not worker.is_alive()
+    assert state.snapshot()['activity'] is None
+    assert state.snapshot()['counters']['done'] == 1
+    assert 'checking_instant' in state.stages and 'uploading' in state.stages and 'checking_remote' in state.stages
+
+
+def test_activity_is_cleared_on_failure_and_not_restored_from_journal(tmp_path):
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location('p123sync_activity_journal_test', _PLUGIN_DIR / 'sync_journal.py')
+    journal_mod = importlib.util.module_from_spec(spec); sys.modules[spec.name] = journal_mod; spec.loader.exec_module(journal_mod)
+    journal = journal_mod.SyncJournal(tmp_path / 'activity.sqlite3')
+    pair = make_pair(tmp_path)
+    state = engine_mod.RunState(journal=journal); state.begin([pair])
+    state.set_activity('t1', 'movie.mkv', 'hashing', total_bytes=100)
+    state.update_activity_bytes('t1', 'movie.mkv', 'hashing', 20)
+    state.set_phase('uploading', 'test')  # checkpoint while an activity is visible
+    restored = engine_mod.RunState.restore(journal, recover=False)
+    assert restored.snapshot()['activity'] is None
+    state.finish('error', 'failed')
+    assert state.snapshot()['activity'] is None
+    journal.close()
 
 
 def test_retry_missing_source_stays_failed(local_tree):
@@ -1418,3 +1476,84 @@ def test_monitor_fail_gives_up_after_identical_failures(tmp_path):
     journal.observe_files('p', 'scope', [{'path': 'a.pdf', 'size': 9, 'mtime_ns': 2}], now=3400, complete=True)
     assert journal.monitor_counts('p', 'scope')['gave_up'] == 0
     journal.close()
+
+
+# ------------------------------------------------------- md5 prefetch pipeline
+
+def test_prefetch_hashes_next_file_during_current_upload(local_tree):
+    """Upcoming MD5s are computed by background workers while a file uploads."""
+    order: list[tuple[str, str]] = []
+    lock = threading.Lock()
+    e01_hashed = threading.Event()
+
+    class Cloud(FakeClient):
+        def _file_md5(self, path, cancel_check=None, on_progress=None):
+            with lock:
+                order.append(('hash_start', path.name))
+            digest = super()._file_md5(path, cancel_check, on_progress)
+            if path.name == 'e01.mkv':
+                e01_hashed.set()
+            return digest
+
+        def upload(self, local_path, parent_file_id, name, on_progress=None,
+                   cancel_check=None, file_md5=None, on_stage=None):
+            with lock:
+                order.append(('upload_start', name))
+            if name == 'a.txt':
+                # The first upload must wait for a digest that only a
+                # background worker can produce; without the prefetch
+                # pipeline this waits out the timeout and fails.
+                assert e01_hashed.wait(timeout=10), 'MD5 prefetch did not overlap the upload'
+            result = super().upload(local_path, parent_file_id, name, on_progress,
+                                    cancel_check, file_md5, on_stage)
+            with lock:
+                order.append(('upload_end', name))
+            return result
+
+    client = Cloud(remote={"0": [FakeItem(1, "test", 1)]})
+    state, summary = run_engine(client, [make_pair(local_tree.parent, exclude_ext=[".nfo"])])
+    snap = state.snapshot()
+    assert summary["phase"] == engine_mod.PHASE_FINISHED
+    assert snap["counters"]["done"] == 3 and snap["counters"]["failed"] == 0
+    assert order.index(('hash_start', 'e01.mkv')) < order.index(('upload_end', 'a.txt'))
+
+
+def test_prefetch_wait_reuses_inflight_hash_instead_of_rehashing(local_tree):
+    class StaggeredHash(FakeClient):
+        def __init__(self, remote=None):
+            super().__init__(remote)
+            self.hash_calls: list[str] = []
+
+        def _file_md5(self, path, cancel_check=None, on_progress=None):
+            self.hash_calls.append(path.name)
+            # e01 hashes slower than a.txt uploads, so the executing thread
+            # reaches e01 while its background hash is still in flight.
+            time.sleep(0.8 if path.name == 'e01.mkv' else 0.02)
+            return super()._file_md5(path, cancel_check, on_progress)
+
+    client = StaggeredHash(remote={"0": [FakeItem(1, "test", 1)]})
+    state, summary = run_engine(client, [make_pair(local_tree.parent, exclude_ext=[".nfo"])])
+    assert summary["phase"] == engine_mod.PHASE_FINISHED
+    # Exactly one full read per file: in-flight hashes are awaited, not rerun.
+    assert sorted(client.hash_calls) == ["a.txt", "e01.mkv", "e02.mkv"]
+
+
+def test_prefetch_background_failure_is_reported_by_inline_rerun(local_tree):
+    class BrokenHash(FakeClient):
+        def __init__(self, remote=None):
+            super().__init__(remote)
+            self.hash_calls: dict[str, int] = {}
+
+        def _file_md5(self, path, cancel_check=None, on_progress=None):
+            self.hash_calls[path.name] = self.hash_calls.get(path.name, 0) + 1
+            if path.name == 'e01.mkv':
+                raise OSError('simulated read failure')
+            return super()._file_md5(path, cancel_check, on_progress)
+
+    client = BrokenHash(remote={"0": [FakeItem(1, "test", 1)]})
+    state, summary = run_engine(client, [make_pair(local_tree.parent, exclude_ext=[".nfo"])])
+    snap = state.snapshot()
+    assert summary["phase"] == engine_mod.PHASE_FINISHED
+    assert snap["counters"]["failed"] == 1 and snap["counters"]["done"] == 2
+    # The background attempt failed silently; the inline re-run raised it.
+    assert client.hash_calls["e01.mkv"] == 2

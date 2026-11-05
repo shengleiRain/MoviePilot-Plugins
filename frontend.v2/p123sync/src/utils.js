@@ -31,7 +31,8 @@ export const PHASE_TEXT = {
   idle: '未运行',
   scanning: '扫描本地',
   listing: '列举远端',
-  uploading: '上传中',
+  verifying: '严格校验',
+  uploading: '处理文件',
   finished: '已完成',
   cancelled: '已取消',
   error: '出错',
@@ -41,10 +42,34 @@ export const PHASE_COLOR = {
   idle: 'grey',
   scanning: 'info',
   listing: 'info',
+  verifying: 'info',
   uploading: 'primary',
   finished: 'success',
   cancelled: 'warning',
   error: 'error',
+}
+
+export const ACTIVITY_TEXT = {
+  checking_existing: '核对云端同名文件',
+  hashing: '读取本地文件并计算 MD5',
+  checking_remote: '核对云端文件',
+  checking_instant: '向云盘申请秒传',
+  preparing_upload: '准备上传分片',
+  reading_upload: '读取待上传分片',
+  uploading: '上传分片',
+  upload_retry: '上传失败，等待重试',
+  completing_upload: '等待云盘完成上传',
+  replacing: '安全替换并核对云端文件',
+  strict_verification: '严格校验文件',
+}
+
+export function activityText(activity) {
+  return ACTIVITY_TEXT[activity?.stage] || '处理文件中'
+}
+
+export function activityPercent(activity) {
+  const total = Number(activity?.total_bytes) || 0
+  return total > 0 ? Math.min(Math.max((Number(activity?.processed_bytes) || 0) / total * 100, 0), 100) : 0
 }
 
 export const FILE_STATE_TEXT = {

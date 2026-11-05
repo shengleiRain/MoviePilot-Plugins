@@ -320,13 +320,23 @@ class P123SyncClient:
         except P123ClientError:
             return False
 
-    def _file_md5(self, path: Path, cancel_check: Optional[Callable[[], bool]] = None) -> str:
+    def _file_md5(self, path: Path, cancel_check: Optional[Callable[[], bool]] = None,
+                  on_progress: Optional[Callable[[int], None]] = None) -> str:
         hasher = md5()
+        processed = 0
+        last_report = 0.0
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(MD5_CHUNK_SIZE), b""):
                 if cancel_check and cancel_check():
                     raise KeyboardInterrupt
                 hasher.update(chunk)
+                processed += len(chunk)
+                now = time.monotonic()
+                if on_progress and now - last_report >= 0.5:
+                    on_progress(processed)
+                    last_report = now
+        if on_progress:
+            on_progress(processed)
         return hasher.hexdigest()
 
     def _put(self, url: str, data: bytes) -> None:
@@ -350,15 +360,18 @@ class P123SyncClient:
         on_progress: Optional[Callable[[float], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         file_md5: Optional[str] = None,
+        on_stage: Optional[Callable[[str], None]] = None,
     ) -> Tuple[int, bool]:
         """Upload one file. Returns (remote_file_id, instant_upload)."""
         file_size = local_path.stat().st_size
-        self._log(f"计算 MD5: {name} ({file_size / 1024 ** 2:.1f} MB)")
         file_md5 = file_md5 or self._file_md5(local_path, cancel_check)
         if cancel_check and cancel_check():
             raise KeyboardInterrupt
 
         # 1) instant upload attempt
+        if on_stage:
+            on_stage("checking_instant")
+        instant_started = time.monotonic()
         resp = self._checked(
             "upload_request",
             {
@@ -371,6 +384,8 @@ class P123SyncClient:
             },
         )
         data = resp.get("data") or {}
+        self._log(f"秒传请求完成: {name}，耗时 {time.monotonic() - instant_started:.1f} 秒，"
+                  f"{'命中' if data.get('Reuse') else '未命中'}")
         if data.get("Reuse"):
             info = data.get("Info") or {}
             return int(info["FileId"]), True
@@ -381,20 +396,34 @@ class P123SyncClient:
             raise P123ClientError("upload_request 未返回有效 SliceSize")
         upload_data: Dict[str, Any] = dict(data)
         instant = False
+        upload_started = time.monotonic()
 
         if file_size > slice_size:
             self._log(f"分片上传: {name}，分片大小 {slice_size / 1024 ** 2:.1f} MB")
             offset = 0
             slice_no = 1
             with open(local_path, "rb") as f:
-                for chunk in iter(lambda: f.read(slice_size), b""):
+                def chunks():
+                    while True:
+                        if cancel_check and cancel_check():
+                            raise KeyboardInterrupt
+                        if on_stage:
+                            on_stage("reading_upload")
+                        chunk = f.read(slice_size)
+                        if not chunk:
+                            return
+                        yield chunk
+
+                for chunk in chunks():
                     if cancel_check and cancel_check():
                         raise KeyboardInterrupt
                     num_to_upload = min(slice_size, file_size - offset)
                     upload_data["partNumberStart"] = slice_no
                     upload_data["partNumberEnd"] = slice_no + 1
+                    if on_stage:
+                        on_stage("preparing_upload")
                     url_resp = self._checked("upload_prepare", upload_data)
-                    self._put_with_retry(url_resp, upload_data, str(slice_no), chunk, cancel_check)
+                    self._put_with_retry(url_resp, upload_data, str(slice_no), chunk, cancel_check, on_stage)
                     slice_no += 1
                     offset += num_to_upload
                     if on_progress:
@@ -403,18 +432,25 @@ class P123SyncClient:
             if cancel_check and cancel_check():
                 raise KeyboardInterrupt
             self._log(f"直传: {name}")
+            if on_stage:
+                on_stage("preparing_upload")
             auth_resp = self._checked("upload_auth", upload_data)
-            self._put_with_retry(auth_resp, upload_data, "1", local_path.read_bytes(), cancel_check)
+            if on_stage:
+                on_stage("reading_upload")
+            self._put_with_retry(auth_resp, upload_data, "1", local_path.read_bytes(), cancel_check, on_stage)
             if on_progress:
                 on_progress(100.0)
 
         upload_data["isMultipart"] = file_size > slice_size
         if cancel_check and cancel_check():
             raise KeyboardInterrupt
+        if on_stage:
+            on_stage("completing_upload")
         complete = self._checked("upload_complete", upload_data)
         info = ((complete.get("data") or {}).get("file_info")) or {}
         if not info.get("FileId"):
             raise P123ClientError("upload_complete 未返回 FileId")
+        self._log(f"云盘上传完成确认: {name}，耗时 {time.monotonic() - upload_started:.1f} 秒")
         return int(info["FileId"]), instant
 
     def _put_with_retry(
@@ -424,6 +460,7 @@ class P123SyncClient:
         part_key: str,
         chunk: bytes,
         cancel_check: Optional[Callable[[], bool]] = None,
+        on_stage: Optional[Callable[[str], None]] = None,
     ) -> None:
         """PUT one slice, retrying with a fresh presigned URL on failures."""
         current = url_resp
@@ -434,12 +471,16 @@ class P123SyncClient:
             part_url = (current.get("data") or {}).get("presignedUrls", {}).get(part_key)
             if part_url:
                 try:
+                    if on_stage:
+                        on_stage("uploading")
                     self._put(part_url, chunk)
                     return
                 except Exception as err:  # noqa: PERF203 - retry loop
                     last_error = err
                     self._log(f"分片 {part_key} 上传失败 ({attempt}/{UPLOAD_RETRIES}): {type(err).__name__}")
             if attempt < UPLOAD_RETRIES:
+                if on_stage:
+                    on_stage("upload_retry")
                 self._wait(UPLOAD_RETRY_WAIT_SECONDS, cancel_check)
                 try:
                     current = self._checked("upload_prepare", upload_data)

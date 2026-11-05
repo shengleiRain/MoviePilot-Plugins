@@ -4,6 +4,10 @@
     <div v-if="error" class="text-body-2 text-warning">状态暂时不可用，正在重试</div>
     <template v-else-if="status && status.started_at">
       <div v-if="running" class="text-body-2 mb-2">{{ status.phase_detail || '正在处理' }}</div>
+      <div v-if="running && status.activity" class="text-caption mb-2">
+        {{ activityText(status.activity) }}<span v-if="status.activity.path"> · {{ status.activity.path }}</span>
+        <span v-if="status.activity.stage === 'hashing' && status.activity.total_bytes"> · {{ Math.round(activityPercent(status.activity)) }}%</span>
+      </div>
       <template v-if="running"><v-progress-linear :model-value="overallPercent" height="8" rounded color="primary" /><div class="text-caption text-medium-emphasis mt-2">{{ fmtBytes(doneBytes) }} / {{ fmtBytes(totalBytes) }} · {{ fmtSpeed(status.speed) }}<span v-if="status.eta"> · 剩余 {{ fmtDuration(status.eta) }}</span></div></template>
       <div v-else class="text-caption text-medium-emphasis mb-2">最近一次 · {{ fmtTime(status.started_at) }}</div>
       <div class="d-flex flex-wrap ga-4 mt-3"><div v-for="item in metrics" :key="item.key"><div class="text-subtitle-1 font-weight-medium">{{ status.counters?.[item.key] ?? 0 }}</div><div class="text-caption text-medium-emphasis">{{ item.label }}</div></div></div>
@@ -14,7 +18,7 @@
 </template>
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { fmtBytes, fmtSpeed, fmtDuration, fmtTime, PHASE_TEXT, PHASE_COLOR } from '../utils'
+import { fmtBytes, fmtSpeed, fmtDuration, fmtTime, PHASE_TEXT, PHASE_COLOR, activityText, activityPercent } from '../utils'
 const props = defineProps({ api: { type: Object, required: true }, pluginId: { type: String, default: 'P123Sync' } })
 const status = ref(null)
 const error = ref(false)

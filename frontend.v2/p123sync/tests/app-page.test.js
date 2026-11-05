@@ -12,6 +12,44 @@ beforeAll(() => {
 afterEach(() => vi.useRealTimers())
 
 describe('sync task page', () => {
+  it('shows the live file stage and local hash progress without calling it network transfer', async () => {
+    const api = { get: vi.fn(async path => {
+      if (path.includes('/status')) return { run_id:'r', running:true, phase:'uploading', started_at:1,
+        counters:{total_files:1,total_bytes:100,failed:0}, pairs:{}, bytes_transferred:0,
+        activity:{key:'p:movie.mkv',path:'movie.mkv',stage:'hashing',elapsed:8,processed_bytes:40,total_bytes:100} }
+      if (path.endsWith('/tasks')) return { tasks: [] }
+      if (path.endsWith('/history')) return { list: [] }
+      return {run_id:'r',page:1,pages:1,total:1,items:[{key:'p:movie.mkv',path:'movie.mkv',state:'pending',size:100,percent:0}]}
+    }) }
+    const wrapper = mount(AppPage, { props:{api}, global:{plugins:[createVuetify({components, directives})], stubs:{VSnackbar:true}} })
+    await flushPromises()
+    expect(wrapper.text()).toContain('读取本地文件并计算 MD5')
+    expect(wrapper.text()).toContain('movie.mkv')
+    expect(wrapper.text()).toContain('本地已读取 40 B / 100 B')
+    expect(wrapper.text()).toContain('已确认传输 0 B')
+    await wrapper.findAll('button').find(button => button.text().includes('文件明细')).trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('读取本地文件并计算 MD5')
+    wrapper.unmount()
+  })
+
+  it('labels upload progress as confirmed by completed parts', async () => {
+    const api = { get: vi.fn(async path => {
+      if (path.includes('/status')) return { run_id:'r', running:true, phase:'uploading', started_at:1,
+        counters:{total_files:1,total_bytes:100,failed:0}, pairs:{}, bytes_transferred:30,
+        activity:{key:'p:movie.mkv',path:'movie.mkv',stage:'uploading',elapsed:8,processed_bytes:30,total_bytes:100} }
+      if (path.endsWith('/tasks')) return { tasks: [] }
+      if (path.endsWith('/history')) return { list: [] }
+      return {run_id:'r',page:1,pages:1,total:0,items:[]}
+    }) }
+    const wrapper = mount(AppPage, { props:{api}, global:{plugins:[createVuetify({components, directives})], stubs:{VSnackbar:true}} })
+    await flushPromises()
+    expect(wrapper.text()).toContain('上传分片')
+    expect(wrapper.text()).toContain('已确认上传 30 B / 100 B')
+    expect(wrapper.text()).toContain('分片完成后更新')
+    wrapper.unmount()
+  })
+
   it('shows configured tasks before any run, starts the selected task, and keeps disabled tasks disabled', async () => {
     const api = {
       get: vi.fn(async path => {

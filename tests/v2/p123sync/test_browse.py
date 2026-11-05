@@ -88,8 +88,8 @@ def test_root_source_is_preserved(plugin_module):
 
 def test_versioned_frontend_and_dashboard_registration(plugin_module):
     plugin = plugin_module.P123Sync()
-    assert plugin.plugin_version == '1.7.1'
-    assert plugin.get_render_mode() == ('vue', 'dist/v1_7_1')
+    assert plugin.plugin_version == '1.7.2'
+    assert plugin.get_render_mode() == ('vue', 'dist/v1_7_2')
     assert plugin.get_dashboard() == ({'cols': 12, 'md': 6}, {'border': False}, None)
 
 
@@ -262,10 +262,39 @@ def test_client_instant_upload_does_not_count_as_network_transfer(plugin_module,
         requests.append((method, payload))
         return {'data': {'Reuse':True, 'Info':{'FileId':123}}}
     monkeypatch.setattr(client, '_checked', checked)
-    progress = []
-    assert client.upload(sample, 0, 'a.mkv', on_progress=progress.append) == (123, True)
+    progress, stages = [], []
+    assert client.upload(sample, 0, 'a.mkv', on_progress=progress.append, on_stage=stages.append) == (123, True)
     assert requests[0][1]['duplicate'] == 0
     assert progress == []
+    assert stages == ['checking_instant']
+
+
+def test_md5_reports_real_bytes_read(plugin_module, tmp_path):
+    import hashlib
+    client = plugin_module.P123SyncClient('account', 'secret')
+    sample = tmp_path / 'sample.bin'; content = b'a' * (1024 * 1024 + 7); sample.write_bytes(content)
+    progress = []
+    assert client._file_md5(sample, on_progress=progress.append) == hashlib.md5(content).hexdigest()
+    assert progress and progress[-1] == len(content)
+    assert progress == sorted(progress) and all(0 < count <= len(content) for count in progress)
+
+
+def test_upload_reports_request_transfer_and_finalization_stages(plugin_module, monkeypatch, tmp_path):
+    client = plugin_module.P123SyncClient('account', 'secret')
+    sample = tmp_path / 'sample.bin'; sample.write_bytes(b'abcde')
+    def checked(name, payload):
+        if name == 'upload_request': return {'data': {'Reuse':False, 'SliceSize':2}}
+        if name == 'upload_prepare': return {'data': {'presignedUrls': {str(payload['partNumberStart']):'url'}}}
+        if name == 'upload_complete': return {'data': {'file_info': {'FileId':123}}}
+        raise AssertionError(name)
+    monkeypatch.setattr(client, '_checked', checked)
+    monkeypatch.setattr(client, '_put', lambda url, data: None)
+    stages, progress = [], []
+    assert client.upload(sample, 0, 'sample.bin', file_md5='digest', on_stage=stages.append,
+                         on_progress=progress.append) == (123, False)
+    assert stages[0] == 'checking_instant' and stages[-1] == 'completing_upload'
+    assert stages.count('preparing_upload') == stages.count('uploading') == 3
+    assert progress == [40.0, 80.0, 100.0]
 
 
 def test_cloud_error_keeps_numeric_code_without_exposing_response(plugin_module, monkeypatch):
@@ -532,8 +561,8 @@ def test_plugin_worker_persists_and_restores_completed_sync(plugin_module, tmp_p
         def find_files_by_name(self, parent_id, name, cancel_check=None): return [x for x in self.items if x.name == name]
         def walk(self, parent_id, prefix='', cancel_check=None):
             for item in self.items: yield item.name, item
-        def _file_md5(self, path, cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
-        def upload(self, path, parent_id, name, on_progress=None, cancel_check=None, file_md5=None):
+        def _file_md5(self, path, cancel_check=None, on_progress=None): return hashlib.md5(path.read_bytes()).hexdigest()
+        def upload(self, path, parent_id, name, on_progress=None, cancel_check=None, file_md5=None, on_stage=None):
             self.uploads += 1
             if on_progress: on_progress(100)
             self.items.append(SimpleNamespace(name=name, file_id=41, size=path.stat().st_size, md5=file_md5, is_dir=False))
@@ -579,12 +608,12 @@ def test_upload_put_http_failure_is_not_reported_as_success(plugin_module):
 def test_release_zip_contains_only_current_plugin_sources_and_assets(tmp_path):
     import subprocess, sys, zipfile
     root = Path(__file__).resolve().parents[3]
-    output = tmp_path / 'p123sync_v1.7.1.zip'
+    output = tmp_path / 'p123sync_v1.7.2.zip'
     subprocess.run([sys.executable, str(root / '.github/scripts/package_p123sync_release.py'), str(output)],
                    cwd=root, check=True, capture_output=True, text=True)
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
-        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_7_1/remoteEntry.js' in names
+        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_7_2/remoteEntry.js' in names
         assert all(not name.startswith(('dist/assets/', 'dist/v1_4_0/', 'dist/v1_5_0/', 'dist/v1_6_0/')) for name in names)
         assert not any('__pycache__' in name or name.endswith('.sqlite3') for name in names)
         assert archive.testzip() is None
@@ -649,8 +678,8 @@ def test_directory_monitor_waits_for_stability_and_acknowledges_exact_files(plug
         def find_files_by_name(self, parent_id, name, cancel_check=None): return [x for x in self.items if x.name == name]
         def walk(self, parent_id, prefix='', cancel_check=None):
             for item in self.items: yield item.name,item
-        def _file_md5(self, path, cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
-        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None):
+        def _file_md5(self, path, cancel_check=None, on_progress=None): return hashlib.md5(path.read_bytes()).hexdigest()
+        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None,on_stage=None):
             self.uploads.append(name)
             if on_progress: on_progress(100)
             self.items.append(SimpleNamespace(name=name,file_id=101,size=path.stat().st_size,md5=file_md5,is_dir=False))
@@ -713,8 +742,8 @@ def test_monitor_retries_lost_upload_response_after_backoff_without_duplicate(pl
         def find_files_by_name(self,parent_id,name,cancel_check=None): return [x for x in self.items if x.name==name]
         def walk(self,parent_id,prefix='',cancel_check=None):
             for item in self.items: yield item.name,item
-        def _file_md5(self,path,cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
-        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None):
+        def _file_md5(self,path,cancel_check=None,on_progress=None): return hashlib.md5(path.read_bytes()).hexdigest()
+        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None,on_stage=None):
             self.uploads += 1
             self.items.append(SimpleNamespace(name=name,file_id=201,size=path.stat().st_size,md5=file_md5,is_dir=False))
             raise RuntimeError('response lost')
@@ -779,8 +808,8 @@ def test_downloader_monitor_queues_and_syncs_only_confirmed_completed_files(plug
         def find_files_by_name(self,parent_id,name,cancel_check=None): return [x for x in self.items if x.name == name]
         def walk(self,parent_id,prefix='',cancel_check=None):
             for item in self.items: yield item.name,item
-        def _file_md5(self,path,cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
-        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None):
+        def _file_md5(self,path,cancel_check=None,on_progress=None): return hashlib.md5(path.read_bytes()).hexdigest()
+        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None,on_stage=None):
             self.uploads.append(name)
             if on_progress: on_progress(100)
             self.items.append(SimpleNamespace(name=name,file_id=8,size=3,md5=file_md5,is_dir=False))
@@ -915,8 +944,8 @@ def test_unexpected_worker_exit_is_durable_and_monitor_retry_reconciles(plugin_m
         def find_files_by_name(self,parent_id,name,cancel_check=None): return [x for x in self.items if x.name==name]
         def walk(self,parent_id,prefix='',cancel_check=None):
             for item in self.items: yield item.name,item
-        def _file_md5(self,path,cancel_check=None): return hashlib.md5(path.read_bytes()).hexdigest()
-        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None):
+        def _file_md5(self,path,cancel_check=None,on_progress=None): return hashlib.md5(path.read_bytes()).hexdigest()
+        def upload(self,path,parent_id,name,on_progress=None,cancel_check=None,file_md5=None,on_stage=None):
             self.uploads+=1
             self.items.append(SimpleNamespace(name=name,file_id=201,size=3,md5=file_md5,is_dir=False))
             raise SystemExit('simulated worker death')

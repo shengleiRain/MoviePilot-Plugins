@@ -51,9 +51,29 @@
           </div>
           <v-progress-linear :model-value="overallPercent" height="10" rounded color="primary" />
           <div class="mt-2 text-body-2 text-medium-emphasis d-flex flex-wrap ga-3">
-            <span>{{ fmtBytes(doneBytes) }} / {{ fmtBytes(totalBytes) }}</span><span>速度 {{ fmtSpeed(status.speed) }}</span>
+            <span>{{ fmtBytes(doneBytes) }} / {{ fmtBytes(totalBytes) }}</span><span>上传速度 {{ fmtSpeed(status.speed) }}</span>
             <span>已确认传输 {{ fmtBytes(status.bytes_transferred) }}</span>
             <span v-if="status.eta">剩余 {{ fmtDuration(status.eta) }}</span><span v-if="status.elapsed">已用 {{ fmtDuration(status.elapsed) }}</span>
+          </div>
+          <div v-if="activeWork" class="activity-box mt-4 pa-3">
+            <div class="d-flex align-center flex-wrap ga-2">
+              <span class="text-subtitle-2">{{ activeWork.path ? '当前文件' : '当前处理' }}</span>
+              <v-chip size="small" color="primary" variant="tonal">{{ activityText(activeWork) }}</v-chip>
+              <span class="text-caption text-medium-emphasis">本阶段已用 {{ fmtDuration(activeWork.elapsed) }}</span>
+            </div>
+            <div v-if="activeWork.path" class="text-body-2 activity-path mt-2" :title="activeWork.path">{{ activeWork.path }}</div>
+            <div v-if="activeWork.stage === 'strict_verification'" class="text-caption text-medium-emphasis mt-1">
+              已完成 {{ activeWork.completed_files || 0 }} / {{ activeWork.total_files || 0 }} 个文件
+            </div>
+            <template v-if="activityHasProgress(activeWork)">
+              <v-progress-linear :model-value="activityPercent(activeWork)" height="6" rounded color="primary" class="mt-2" />
+              <div class="text-caption text-medium-emphasis mt-1">
+                {{ activeWork.stage === 'hashing' ? '本地已读取' : '已确认上传' }}
+                {{ fmtBytes(activeWork.processed_bytes) }} / {{ fmtBytes(activeWork.total_bytes) }}
+                · {{ Math.round(activityPercent(activeWork)) }}%
+                <span v-if="activeWork.stage === 'uploading'"> · 分片完成后更新</span>
+              </div>
+            </template>
           </div>
           <v-row dense class="mt-3">
             <v-col v-for="item in counterItems" :key="item.key" cols="6" sm="3">
@@ -120,8 +140,8 @@
           <v-table density="compact"><thead><tr><th>文件</th><th>大小</th><th style="min-width: 160px">进度</th><th>速度</th><th>状态</th><th>操作</th></tr></thead>
             <tbody><tr v-for="file in visibleFiles" :key="file.key">
               <td :title="file.path"><div class="text-body-2">{{ shortName(file.path) }}</div><div class="text-caption text-medium-emphasis">{{ file.pair_name }}</div><div v-if="file.error" class="text-caption text-error">{{ file.error }}</div></td>
-              <td>{{ fmtBytes(file.size) }}</td><td><v-progress-linear :model-value="file.percent || 0" height="6" rounded :color="fileStateColor(file.state)" /></td>
-              <td>{{ fmtSpeed(file.speed) }}</td><td><v-chip :color="fileStateColor(file.state)" size="small" variant="tonal" label>{{ fileStateText(file.state) }}</v-chip></td>
+              <td>{{ fmtBytes(file.size) }}</td><td><v-progress-linear :model-value="fileProgress(file)" height="6" rounded :color="fileStateColor(file.state)" /></td>
+              <td>{{ fmtSpeed(file.speed) }}</td><td><v-chip :color="fileStateColor(file.state)" size="small" variant="tonal" label>{{ fileStatus(file) }}</v-chip></td>
               <td><v-btn v-if="file.state === 'failed' && !historyRunId" size="small" variant="text" color="primary" :disabled="running || starting" @click="retryFiles([file.key])">重试</v-btn></td>
             </tr><tr v-if="!visibleFiles.length"><td colspan="6" class="text-body-2 text-medium-emphasis">{{ filesLoading ? '正在读取文件…' : (filesError ? '文件明细暂时不可用' : (historyRunId ? '暂无符合筛选条件的历史文件' : (fileCount ? '没有符合筛选条件的文件' : '暂无文件记录'))) }}</td></tr></tbody>
           </v-table>
@@ -153,7 +173,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   fmtBytes, fmtSpeed, fmtDuration, fmtTime,
-  PHASE_TEXT, PHASE_COLOR, FILE_STATE_TEXT, FILE_STATE_COLOR, POLICY_TEXT,
+  PHASE_TEXT, PHASE_COLOR, FILE_STATE_TEXT, FILE_STATE_COLOR, POLICY_TEXT, activityText, activityPercent,
 } from '../utils'
 
 const props = defineProps({
@@ -183,6 +203,7 @@ const snackbar = reactive({ show: false, text: '', color: 'success' })
 let timer = null
 
 const running = computed(() => !!status.value?.running || !!status.value?.external_run_active)
+const activeWork = computed(() => running.value ? status.value?.activity || null : null)
 const counters = computed(() => status.value?.counters || {})
 const doneBytes = computed(() => (status.value?.bytes_done || 0) + (status.value?.bytes_skipped || 0) + (status.value?.bytes_inflight || 0))
 const totalBytes = computed(() => counters.value.total_bytes || 0)
@@ -228,6 +249,16 @@ function fileStateText(state) {
 }
 function fileStateColor(state) {
   return FILE_STATE_COLOR[state] || 'grey'
+}
+function activityHasProgress(activity) {
+  return ['hashing', 'uploading'].includes(activity?.stage) && Number(activity?.total_bytes) > 0
+}
+function fileStatus(file) {
+  return !historyRunId.value && activeWork.value?.key === file.key ? activityText(activeWork.value) : fileStateText(file.state)
+}
+function fileProgress(file) {
+  return !historyRunId.value && activeWork.value?.key === file.key && activityHasProgress(activeWork.value)
+    ? activityPercent(activeWork.value) : (file.percent || 0)
 }
 function phaseTextOf(phase, failed) {
   return phase === 'finished' && failed ? '已完成（有失败）' : (PHASE_TEXT[phase] || phase)
@@ -396,5 +427,7 @@ onUnmounted(() => {
 .task-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 12px; }
 .task-title { min-width: 0; overflow-wrap: anywhere; }
 .path-row { display: flex; flex-direction: column; gap: 2px; font-size: .875rem; overflow-wrap: anywhere; }
+.activity-box { background: rgba(var(--v-theme-primary), .07); border-radius: 10px; }
+.activity-path { overflow-wrap: anywhere; }
 
 </style>
