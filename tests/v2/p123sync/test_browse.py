@@ -606,15 +606,17 @@ def test_upload_put_http_failure_is_not_reported_as_success(plugin_module):
 
 
 def test_release_zip_contains_only_current_plugin_sources_and_assets(tmp_path):
-    import subprocess, sys, zipfile
+    import json, subprocess, sys, zipfile
     root = Path(__file__).resolve().parents[3]
-    output = tmp_path / 'p123sync_v1.7.3.zip'
+    version = json.loads((root / 'package.v2.json').read_text(encoding='utf-8'))['P123Sync']['version']
+    dist_dir = 'dist/v' + version.replace('.', '_') + '/'
+    output = tmp_path / f'p123sync_v{version}.zip'
     subprocess.run([sys.executable, str(root / '.github/scripts/package_p123sync_release.py'), str(output)],
                    cwd=root, check=True, capture_output=True, text=True)
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
-        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and 'dist/v1_7_3/remoteEntry.js' in names
-        assert all(not name.startswith(('dist/assets/', 'dist/v1_4_0/', 'dist/v1_5_0/', 'dist/v1_6_0/')) for name in names)
+        assert 'sync_journal.py' in names and 'auto_monitor.py' in names and f'{dist_dir}remoteEntry.js' in names
+        assert all(not name.startswith('dist/') or name.startswith(dist_dir) for name in names)
         assert not any('__pycache__' in name or name.endswith('.sqlite3') for name in names)
         assert archive.testzip() is None
 
