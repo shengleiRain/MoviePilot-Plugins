@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN = ROOT / 'plugins.v2' / 'p123sync'
-SOURCE_FILES = ('__init__.py', 'p123_client.py', 'sync_engine.py', 'sync_journal.py', 'auto_monitor.py', 'README.md', 'requirements.txt')
+SOURCE_FILES = ('__init__.py', 'p123_client.py', 'sync_engine.py', 'sync_journal.py', 'auto_monitor.py', 'acquisition_status.py', 'README.md', 'requirements.txt')
 
 
 def build(output: Path) -> str:

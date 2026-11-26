@@ -32,6 +32,7 @@ class SyncJournal:
             self._conn.execute('PRAGMA journal_mode=WAL')
             self._conn.execute('CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, meta TEXT NOT NULL)')
             self._conn.execute('CREATE TABLE IF NOT EXISTS files (run_id TEXT NOT NULL, file_key TEXT NOT NULL, position INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(run_id, file_key))')
+            self._conn.execute('CREATE INDEX IF NOT EXISTS idx_files_key ON files(file_key)')
             self._conn.execute('CREATE TABLE IF NOT EXISTS current_run (id INTEGER PRIMARY KEY CHECK(id=1), run_id TEXT NOT NULL)')
             self._conn.execute('CREATE TABLE IF NOT EXISTS monitor_files (pair_id TEXT NOT NULL, scope TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, changed_at REAL NOT NULL, present INTEGER NOT NULL DEFAULT 1, synced_size INTEGER, synced_mtime_ns INTEGER, retry_after REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(pair_id,scope,path))')
             self._conn.execute('CREATE TABLE IF NOT EXISTS md5_cache (path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, md5 TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(path, size, mtime_ns))')
@@ -160,6 +161,21 @@ class SyncJournal:
                 (MONITOR_GIVE_UP_FAILURES, pair_id, scope)).fetchone()
             return {'observed': row[0] or 0, 'pending': row[1] or 0, 'missing': row[2] or 0,
                     'gave_up': row[3] or 0}
+
+    def acquisition_file(self, pair_id: str, scope: str, path: str) -> Dict:
+        """Read an exact file's latest checkpoint, never a filename or directory guess."""
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT data FROM files WHERE file_key=? ORDER BY rowid DESC',
+                (f'{pair_id}:{path}',)).fetchall()
+            record = next((item for item in (json.loads(row[0]) for row in rows)
+                           if (item.get('sync_scope') or item.get('monitor_scope')) == scope), None)
+            row = self._conn.execute('''SELECT size,mtime_ns,present,synced_size,synced_mtime_ns,
+                failures,last_error FROM monitor_files WHERE pair_id=? AND scope=? AND path=?''',
+                (pair_id, scope, path)).fetchone()
+            monitor = (dict(zip(('size','mtime_ns','present','synced_size','synced_mtime_ns',
+                                 'failures','last_error'), row)) if row else None)
+            return {'record': record, 'monitor': monitor}
 
     def md5_lookup(self, path: str, size: int, mtime_ns: int) -> Optional[str]:
         """Cached digest for an unchanged source file (size+mtime_ns must match)."""

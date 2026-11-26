@@ -586,7 +586,7 @@ class RunState:
                 raise
 
     def update_retry_file_size(self, key: str, size: int, mtime_ns: Optional[int] = None,
-                               monitor_scope: Optional[str] = None):
+                               monitor_scope: Optional[str] = None, sync_scope: Optional[str] = None):
         with self._lock:
             record = self._file_index[key]
             self.counters["total_bytes"] += size - record["size"]
@@ -594,6 +594,8 @@ class RunState:
             record["source_mtime_ns"] = mtime_ns
             if monitor_scope is not None:
                 record["monitor_scope"] = monitor_scope
+            if sync_scope is not None:
+                record["sync_scope"] = sync_scope
             self._checkpoint([record])
 
     def tick_speed(self):
@@ -789,6 +791,7 @@ class SyncEngine:
         monitor_scopes: Optional[Dict[str, str]] = None,
         journal=None,
         verify_md5: bool = False,
+        sync_scopes: Optional[Dict[str, str]] = None,
     ):
         self.client = client
         self.log = logger
@@ -798,6 +801,9 @@ class SyncEngine:
         self._dir_cache: Dict[str, int] = {}
         self._reserved_paths = set()
         self._monitor_scopes = monitor_scopes or {}
+        # Identifies the account and configuration for manual runs too.
+        # monitor_scope remains restricted to monitored tasks.
+        self._sync_scopes = sync_scopes or {}
         self._journal = journal
         self._verify_md5 = verify_md5
         self._prefetcher: Optional[_HashPrefetcher] = None
@@ -950,7 +956,7 @@ class SyncEngine:
             local_files = [f for f in local_files if f.rel_path in retry_paths]
             for local in local_files:
                 self.state.update_retry_file_size(f"{pair.id}:{local.rel_path}", local.size, local.mtime_ns,
-                                                  self._monitor_scopes.get(pair.id))
+                                                  self._monitor_scopes.get(pair.id), self._sync_scopes.get(pair.id))
             missing = retry_paths - {f.rel_path for f in local_files}
             for rel_path in sorted(missing):
                 key = f"{pair.id}:{rel_path}"
@@ -981,7 +987,8 @@ class SyncEngine:
             if invalid:
                 records = [{"key": f"{pair.id}:{path}", "pair_id": pair.id, "pair_name": pair.name,
                             "path": path, "size": spec['size'], "source_mtime_ns": spec['mtime_ns'],
-                            "monitor_scope": self._monitor_scopes.get(pair.id), "state": FILE_PENDING,
+                            "monitor_scope": self._monitor_scopes.get(pair.id),
+                            "sync_scope": self._sync_scopes.get(pair.id), "state": FILE_PENDING,
                             "percent": 0.0, "speed": 0.0, "error": None}
                            for path, spec in invalid.items()]
                 self.state.add_files(records)
@@ -1034,6 +1041,7 @@ class SyncEngine:
                     "size": action.local.size,
                     "source_mtime_ns": action.local.mtime_ns,
                     "monitor_scope": self._monitor_scopes.get(pair.id),
+                    "sync_scope": self._sync_scopes.get(pair.id),
                     "state": FILE_PENDING,
                     "percent": 0.0,
                     "speed": 0.0,

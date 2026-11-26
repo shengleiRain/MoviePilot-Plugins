@@ -90,13 +90,28 @@ class BrowseRequest(BaseModel):
     password: str = ""
 
 
+class AcquisitionFile(BaseModel):
+    id: str = Field(max_length=160)
+    path: str = Field(max_length=4096)
+
+
+class AcquisitionTorrent(BaseModel):
+    id: str = Field(max_length=160)
+    hash: str = Field(max_length=160)
+
+
+class AcquisitionStatusRequest(BaseModel):
+    files: List[AcquisitionFile] = Field(default_factory=list, max_length=100)
+    torrents: List[AcquisitionTorrent] = Field(default_factory=list, max_length=30)
+
+
 class P123Sync(_PluginBase):
     """One-way 123 cloud drive folder sync with a visual AppPage."""
 
     plugin_name = "123云盘同步"
     plugin_desc = "本地目录同步到123云盘：支持手动、目录监控及下载器监控，大小一致快速跳过、可选MD5严格校验、安全覆盖与中断恢复。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.7.3"
+    plugin_version = "1.7.4"
     plugin_author = "PrivateFilm"
     author_url = "https://github.com/shengleiRain"
     plugin_config_prefix = "p123sync_"
@@ -364,6 +379,13 @@ class P123Sync(_PluginBase):
         """Plugin APIs consumed by the federated frontend (auth=bear)."""
         return [
             {
+                "path": "/acquisition-status",
+                "endpoint": self.api_acquisition_status,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "按确切文件路径查询云盘同步状态",
+            },
+            {
                 "path": "/status",
                 "endpoint": self.api_status,
                 "methods": ["GET"],
@@ -484,7 +506,7 @@ class P123Sync(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
         """Vue federated frontend with a versioned asset directory."""
-        return "vue", "dist/v1_7_3"
+        return "vue", "dist/v1_7_4"
 
     def get_dashboard(self, key: str = "", user_agent: str = None) -> Tuple[dict, dict, None]:
         """Register the federated Dashboard with the MoviePilot host."""
@@ -546,6 +568,41 @@ class P123Sync(_PluginBase):
                 pass
 
     # ------------------------------------------------------------------ api
+
+    def api_acquisition_status(self, request: AcquisitionStatusRequest) -> Dict[str, Any]:
+        # No arbitrary path search, title matching, credentials or raw errors are
+        # returned. A checkpoint is evidence only for the exact unchanged file
+        # and the same configured account/source/target/policy.
+        from .acquisition_status import status_for_files, status_for_torrents
+        with self._run_lock:
+            self._refresh_external_run()
+            pairs = list(self._pairs)
+            passport = self._passport
+            enabled = self._enabled
+            journal = self._journal
+            journal_error = self._journal_error
+            state = self._state
+            snapshot = state.snapshot(include_files=False)
+            # Look up only requested files instead of copying a potentially
+            # enormous run on every PrivateFilm polling cycle.
+            snapshot['_file_lookup'] = state.file_record
+        with self._monitor_lock:
+            monitor = {key: dict(value) for key, value in self._monitor_status.items()}
+        result = status_for_files(request.files, pairs, passport, enabled,
+                                  journal, journal_error, snapshot, monitor)
+        if request.torrents:
+            try:
+                chain, query_status = self._get_download_monitor()
+                result['torrents'] = status_for_torrents(
+                    request.torrents, pairs, passport, enabled, journal, journal_error,
+                    snapshot, monitor, chain, query_status)
+            except Exception:
+                result['torrents'] = [{'id': item.id, 'state': 'unknown', 'progress': None,
+                    'filesTotal': 0, 'filesSynced': 0,
+                    'detail': '下载器文件清单不可用，暂无法核对原文件同步'} for item in request.torrents]
+        else:
+            result['torrents'] = []
+        return result
 
     def api_status(self, include_files: bool = True) -> Dict[str, Any]:
         with self._run_lock:
@@ -1185,6 +1242,7 @@ class P123Sync(_PluginBase):
                                 if p.trigger_mode != TRIGGER_MANUAL},
                 journal=self._journal,
                 verify_md5=self._verify_md5,
+                sync_scopes={p.id: scope_for(p, self._passport) for p in pairs},
             )
             engine.run(pairs, retry_paths=retry_paths, already_started=True, selected_paths=selected_paths)
         except Exception as err:  # noqa: BLE001
